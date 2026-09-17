@@ -42,6 +42,47 @@
             </label>
             <span class="side-note">Sliding/Facts: сколько последних сообщений брать (0 — вся история)</span>
 
+            <!-- СОСТОЯНИЕ ЗАДАЧИ (Task State Machine): формализованный
+                 конечный автомат «этап -> шаг -> ожидаемое действие».
+                 Этапы: planning -> execution -> validation -> done.
+                 Задачу можно поставить НА ПАУЗУ на любом этапе и продолжить
+                 с того же места (цель и журнал сохраняются). Пока задача
+                 ведётся, её состояние подставляется в системный промпт. -->
+            <div class="side-title side-sub">Состояние задачи</div>
+            <div id="task-box" class="task-box">
+                <div class="task-empty">задача не заведена — задайте цель ниже</div>
+            </div>
+            <div class="task-actions">
+                <input type="text" id="task-goal" class="gen-input task-input"
+                       placeholder="цель задачи" maxlength="300">
+                <div class="task-steps" id="task-stages"></div>
+                <div class="task-buttons">
+                    <button id="task-start" type="button" class="btn-side primary">Завести</button>
+                    <button id="task-advance" type="button" class="btn-side">Следующий этап</button>
+                    <button id="task-pause" type="button" class="btn-side link">Пауза</button>
+                    <button id="task-resume" type="button" class="btn-side link">Продолжить</button>
+                    <button id="task-finish" type="button" class="btn-side link">Завершить</button>
+                    <button id="task-reset" type="button" class="btn-side link">Сброс</button>
+                </div>
+            </div>
+            <span class="side-note">этап → шаг → ожидаемое действие; пауза возможна на любом этапе</span>
+
+            <!-- ПРОГОН АВТОНОМНОГО ТЕСТА автомата задачи. Результат
+                 показывается в ОКНЕ ОТВЕТОВ (справа), наглядно по этапам.
+                 Два режима: «логика» (автономный check_task_state.py, без
+                 сети) и «по модели» (выбранная модель ведёт задачу по
+                 этапам — ответы модели + принятые/отклонённые переходы). -->
+            <div class="task-selftest-buttons">
+                <button id="task-selftest" type="button" class="btn-side link"
+                        title="Автономный тест автомата задачи (быстро, без сети)">
+                    ▶ Тест автомата
+                </button>
+                <button id="task-selftest-llm" type="button" class="btn-side link"
+                        title="Прогон задачи по этапам выбранной моделью — ответы модели и переходы">
+                    ▶ Прогон по модели
+                </button>
+            </div>
+
             <!-- Профили (персоны): именованные наборы состояния — своя память,
                  свой диалог и своя манера общения. У профиля задаются ХАРАКТЕР
                  (тон) и ХАРАКТЕР ОТВЕТОВ (формат/длина) — они подставляются в
@@ -49,9 +90,13 @@
                  активную память и диалог. -->
             <div class="side-title side-sub">Профили (персоны)</div>
             <div id="profiles-box" class="profiles-box">
-                <div class="profiles-empty">Профилей пока нет. Создайте профиль — он задаёт системный промпт для ответа.</div>
+                <div class="profiles-empty">Профилей пока нет. Нажмите «Создать профиль».</div>
             </div>
-            <div class="profiles-actions">
+            <!-- Кнопка раскрытия формы создания. Видна, пока форма свёрнута. -->
+            <button id="profile-new" type="button" class="btn-side primary">Создать профиль</button>
+            <!-- Форма создания профиля: скрыта по умолчанию, раскрывается
+                 кнопкой «Создать профиль» и сворачивается после сохранения. -->
+            <div class="profiles-actions" id="profiles-form" hidden>
                 <input type="text" id="profile-name" class="gen-input profile-input"
                        placeholder="имя" maxlength="40">
                 <select id="profile-model" class="gen-input profile-input"
@@ -60,7 +105,10 @@
                        placeholder="характер (тон)" maxlength="200">
                 <input type="text" id="profile-style" class="gen-input profile-input"
                        placeholder="характер ответов (формат)" maxlength="200">
-                <button id="profile-create" type="button" class="btn-side primary">Создать профиль</button>
+                <div class="profiles-form-buttons">
+                    <button id="profile-save" type="button" class="btn-side primary">Сохранить профиль</button>
+                    <button id="profile-cancel" type="button" class="btn-side link">Отмена</button>
+                </div>
             </div>
             <span class="side-note">персона отвечает своей моделью; характер — тон, характер ответов — формат и длину</span>
 

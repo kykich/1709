@@ -582,6 +582,485 @@
     }
 
     // ------------------------------------------------------------------
+    // СОСТОЯНИЕ ЗАДАЧИ (Task State Machine)
+    // ------------------------------------------------------------------
+    // Формализованный конечный автомат: этап (planning -> execution ->
+    // validation -> done) + текущий шаг + ожидаемое действие. Задачу можно
+    // поставить на паузу на любом этапе и продолжить с того же места.
+    var taskBox = document.getElementById("task-box");
+    var taskGoalInp = document.getElementById("task-goal");
+    var taskStagesBox = document.getElementById("task-stages");
+    var taskStartBtn = document.getElementById("task-start");
+    var taskAdvanceBtn = document.getElementById("task-advance");
+    var taskPauseBtn = document.getElementById("task-pause");
+    var taskResumeBtn = document.getElementById("task-resume");
+    var taskFinishBtn = document.getElementById("task-finish");
+    var taskResetBtn = document.getElementById("task-reset");
+    var taskState = { active: false, stage: "planning", paused: false,
+                      stages: ["planning", "execution", "validation", "done"],
+                      stage_labels: {} };
+    var taskJournalOpen = false;
+
+    // Рисует панель задачи по снимку, пришедшему от сервера.
+    function renderTask(task) {
+        if (!task) return;
+        taskState = task;
+        if (!taskBox) return;
+
+        var active = !!task.active;
+        var paused = !!task.paused;
+        var stage = task.stage || "planning";
+        var labels = task.stage_labels || {};
+        var stages = task.stages || ["planning", "execution", "validation", "done"];
+
+        taskBox.innerHTML = "";
+        taskBox.classList.toggle("active", active && !paused && stage !== "done");
+        taskBox.classList.toggle("paused", active && paused);
+        taskBox.classList.toggle("done", active && stage === "done");
+
+        if (!active) {
+            var empty = document.createElement("div");
+            empty.className = "task-empty";
+            empty.textContent = "задача не заведена — задайте цель ниже";
+            taskBox.appendChild(empty);
+        } else {
+            // Цель задачи.
+            var goal = document.createElement("div");
+            goal.className = "task-goal";
+            goal.innerHTML = "<b>Цель:</b> " + esc(task.goal || "(не указана)");
+            taskBox.appendChild(goal);
+
+            // Полоска этапов.
+            var prog = document.createElement("div");
+            prog.className = "task-progress";
+            var curIdx = stages.indexOf(stage);
+            stages.forEach(function (s, i) {
+                var el = document.createElement("span");
+                el.className = "task-stage";
+                if (s === stage) {
+                    el.classList.add("current");
+                    if (paused) el.classList.add("paused");
+                } else if (i < curIdx) {
+                    el.classList.add("done");
+                }
+                el.textContent = labels[s] || s;
+                prog.appendChild(el);
+            });
+            taskBox.appendChild(prog);
+
+            // Бейдж статуса (пауза / активно / завершено).
+            var badge = document.createElement("span");
+            if (stage === "done") {
+                badge.className = "task-badge done";
+                badge.textContent = "завершено";
+            } else if (paused) {
+                badge.className = "task-badge paused";
+                badge.textContent = "пауза";
+            } else {
+                badge.className = "task-badge active";
+                badge.textContent = "в работе";
+            }
+            taskBox.appendChild(badge);
+
+            // Шаг и ожидаемое действие.
+            if (task.step) {
+                var sEl = document.createElement("div");
+                sEl.className = "task-field";
+                sEl.innerHTML = "<b>Шаг:</b> " + esc(task.step);
+                taskBox.appendChild(sEl);
+            }
+            if (task.expected) {
+                var eEl = document.createElement("div");
+                eEl.className = "task-field";
+                eEl.innerHTML = "<b>Ожидается:</b> " + esc(task.expected);
+                taskBox.appendChild(eEl);
+            }
+            // журнал (что уже сделано) — чтобы видеть «продолжение без
+            // повторных объяснений».
+            var hist = task.history || [];
+            if (hist.length) {
+                var jhead = document.createElement("div");
+                jhead.className = "task-field";
+                jhead.style.cursor = "pointer";
+                jhead.textContent = (taskJournalOpen ? "▾ " : "▸ ") +
+                    "журнал (" + hist.length + ")";
+                jhead.addEventListener("click", function () {
+                    taskJournalOpen = !taskJournalOpen;
+                    renderTask(taskState);
+                });
+                taskBox.appendChild(jhead);
+                if (taskJournalOpen) {
+                    var ul = document.createElement("ul");
+                    ul.className = "task-journal";
+                    hist.slice(-8).forEach(function (h) {
+                        var li = document.createElement("li");
+                        li.textContent = "[" + (h.ts || "") + "] " +
+                            (h.stage_label || h.stage || "") + ": " +
+                            (h.detail || "");
+                        ul.appendChild(li);
+                    });
+                    taskBox.appendChild(ul);
+                }
+            }
+        }
+
+        // Кнопки этапов: ручной переход (сервер проверит корректность).
+        if (taskStagesBox) {
+            taskStagesBox.innerHTML = "";
+            if (active && stage !== "done") {
+                stages.forEach(function (s) {
+                    var b = document.createElement("button");
+                    b.type = "button";
+                    b.className = "stage-btn" + (s === stage ? " current" : "");
+                    b.textContent = labels[s] || s;
+                    b.title = "Перевести задачу на этап «" + (labels[s] || s) + "»";
+                    b.addEventListener("click", function () {
+                        taskAction({ action: "advance", stage: s });
+                    });
+                    taskStagesBox.appendChild(b);
+                });
+            }
+        }
+
+        // Доступность кнопок по состоянию автомата.
+        var canStart = true;
+        var canAdvance = active && !paused && stage !== "done";
+        var canPause = active && !paused && stage !== "done";
+        var canResume = active && paused;
+        var canFinish = active && !paused && stage === "validation";
+        var canReset = active;
+        if (taskStartBtn) taskStartBtn.disabled = !canStart;
+        if (taskAdvanceBtn) taskAdvanceBtn.disabled = !canAdvance;
+        if (taskPauseBtn) taskPauseBtn.disabled = !canPause;
+        if (taskResumeBtn) taskResumeBtn.disabled = !canResume;
+        if (taskFinishBtn) taskFinishBtn.disabled = !canFinish;
+        if (taskResetBtn) taskResetBtn.disabled = !canReset;
+        if (taskGoalInp) taskGoalInp.disabled = active && stage !== "done";
+    }
+
+    // Отправляет действие с задачей на сервер и применяет ответ.
+    function taskAction(payload) {
+        return fetch("/api/task", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify(payload),
+        })
+        .then(function (r) { return r.json().catch(function () { return null; }); })
+        .then(function (d) {
+            if (!d) return;
+            if (d.task) renderTask(d.task);
+            if (d.ok === false) {
+                setStatus(d.error || "Недопустимый переход задачи.", "error");
+            } else {
+                var act = payload.action;
+                if (act === "start") setStatus("Задача заведена.", "ok");
+                else if (act === "pause") setStatus("Задача на паузе.", "ok");
+                else if (act === "resume") setStatus("Задача продолжена.", "ok");
+                else if (act === "finish") setStatus("Задача завершена.", "ok");
+                else if (act === "reset") setStatus("Состояние задачи сброшено.", "ok");
+                else if (act === "advance") setStatus("Этап задачи изменён.", "ok");
+            }
+        })
+        .catch(function () {});
+    }
+
+    // «Следующий этап» — переход по цепочке автомата:
+    // planning -> execution -> validation -> done (finish из validation).
+    function nextStage() {
+        var s = taskState.stage || "planning";
+        if (s === "planning") return "execution";
+        if (s === "execution") return "validation";
+        if (s === "validation") return "done";
+        return null;
+    }
+
+    if (taskStartBtn) taskStartBtn.addEventListener("click", function () {
+        var goal = taskGoalInp ? taskGoalInp.value.trim() : "";
+        if (!goal) { setStatus("Введите цель задачи.", "error"); return; }
+        taskAction({ action: "start", goal: goal });
+        if (taskGoalInp) taskGoalInp.value = "";
+    });
+    if (taskAdvanceBtn) taskAdvanceBtn.addEventListener("click", function () {
+        var ns = nextStage();
+        if (!ns) { setStatus("Задача уже завершена.", "error"); return; }
+        if (ns === "done") taskAction({ action: "finish" });
+        else taskAction({ action: "advance", stage: ns });
+    });
+    if (taskPauseBtn) taskPauseBtn.addEventListener("click", function () {
+        taskAction({ action: "pause" });
+    });
+    if (taskResumeBtn) taskResumeBtn.addEventListener("click", function () {
+        taskAction({ action: "resume" });
+    });
+    if (taskFinishBtn) taskFinishBtn.addEventListener("click", function () {
+        taskAction({ action: "finish" });
+    });
+    if (taskResetBtn) taskResetBtn.addEventListener("click", function () {
+        if (!window.confirm("Сбросить состояние задачи?")) return;
+        taskAction({ action: "reset" });
+    });
+
+    // ---- Прогон автомата задачи: результаты в ОКНЕ ОТВЕТОВ ----
+    // Два режима:
+    //   * logic — автономный check_task_state.py (быстро, без сети);
+    //   * llm   — выбранная модель ведёт задачу по этапам (её ответы +
+    //             принятые/отклонённые переходы), наглядно по шагам.
+    var taskSelftestBtn = document.getElementById("task-selftest");
+    var taskSelftestLlmBtn = document.getElementById("task-selftest-llm");
+
+    // Метка выбранной модели (первая включённая) для прогона по модели.
+    function firstSelectedModelLabel() {
+        var m = modelState.find(function (x) { return x.on; });
+        return m ? m.label : null;
+    }
+
+    // Рисует пузырь результата в окне ответов и прокручивает к нему.
+    function pushAssistantHtml(html) {
+        var msg = document.createElement("div");
+        msg.className = "msg a";
+        var b = document.createElement("div");
+        b.className = "bubble selftest-bubble";
+        b.innerHTML = html;
+        msg.appendChild(b);
+        streamEl.appendChild(msg);
+        streamEl.scrollTop = streamEl.scrollHeight;
+        return msg;
+    }
+
+    // HTML: заголовок результата теста (кто и что запускал).
+    function selftestHeaderHtml(title, subtitle) {
+        return '<div class="st-head"><div class="st-head-title">' + esc(title) +
+            '</div>' + (subtitle ? '<div class="st-head-sub">' + esc(subtitle) +
+            '</div>' : '') + '</div>';
+    }
+
+    // HTML визуальной полоски этапов автомата с подсветкой текущего.
+    function stageBarHtml(stages, labels, current, doneUpTo) {
+        var html = '<div class="st-stagebar">';
+        stages.forEach(function (s, i) {
+            var cls = "st-stage";
+            if (s === current) cls += " current";
+            else if (typeof doneUpTo === "number" && i <= doneUpTo) cls += " done";
+            html += '<span class="' + cls + '">' + esc(labels[s] || s) + '</span>';
+            if (i < stages.length - 1) html += '<span class="st-arrow">→</span>';
+        });
+        return html + '</div>';
+    }
+
+    var STAGES_DEFAULT = ["planning", "execution", "validation", "done"];
+    var STAGE_LABELS_DEFAULT = { planning: "планирование", execution: "выполнение",
+                                 validation: "проверка", done: "завершено" };
+
+    // ---- Режим llm: пошаговое прохождение (задержка между этапами) ----
+    // Задержка между отображением шагов, мс — чтобы прохождение было
+    // НАГЛЯДНЫМ (этапы всплывают поочерёдно).
+    var SELFTEST_STEP_DELAY = 2000;
+
+    // Строит «каркас» результата LLM-прогона и возвращает ссылки на узлы,
+    // в которые будем добавлять шаги по одному (с задержкой).
+    function llmResultScaffold(d) {
+        var head = selftestHeaderHtml("Прогон задачи по этапам — выбранной моделью",
+            d && d.model ? ("модель: " + d.model) : "");
+        var html = head;
+        if (d && d.goal) {
+            html += '<div class="st-goal"><b>Цель:</b> ' + esc(d.goal) + '</div>';
+        }
+        // Прогресс-бар готовности (0–100%) + порог паузы.
+        var pauseAt = (d && typeof d.pause_at === "number") ? d.pause_at : 35;
+        html += '<div class="st-progress-wrap">' +
+            '<div class="st-progress"><span class="st-progress-fill" style="width:0%"></span>' +
+            '<span class="st-progress-mark" style="left:' + pauseAt + '%" title="порог паузы ' +
+            pauseAt + '%"></span></div>' +
+            '<div class="st-progress-label">готовность: 0% · пауза на ' +
+            pauseAt + '%</div></div>';
+        var bubble = pushAssistantHtml(html);
+        bubble._pauseAt = pauseAt;
+        return bubble;
+    }
+
+    // HTML одного шага LLM-прогона (kind = step | pause | resume).
+    function llmStepHtml(s) {
+        if (s.kind === "pause") {
+            return '<div class="st-walk st-walk-special paused">' +
+                '<div class="st-walk-head">⏸ Пауза на ' +
+                (s.progress != null ? s.progress : "?") + '% готовности</div>' +
+                '<div class="st-walk-move">этап «' + esc(s.stage_label || "") +
+                '» · состояние сохранено (цель и шаг)</div></div>';
+        }
+        if (s.kind === "resume") {
+            return '<div class="st-walk st-walk-special resumed">' +
+                '<div class="st-walk-head">▶ Продолжение с того же этапа «' +
+                esc(s.stage_label || "") + '»</div>' +
+                '<div class="st-walk-move">без повторных объяснений задачи</div></div>';
+        }
+        var move = s.move || {};
+        var acc = s.accepted;
+        var html = '<div class="st-walk">' +
+            '<div class="st-walk-head">Шаг ' + s.n + ' · этап ' +
+            esc(s.stage_label || s.stage_before || "") +
+            ' <span class="st-move ' + (acc ? "ok" : "bad") + '">' +
+            (acc ? "переход принят" : "переход отклонён") + '</span></div>' +
+            '<div class="st-walk-user"><b>Запрос:</b> ' + esc(s.user) + '</div>' +
+            '<div class="st-walk-answer"><b>Ответ модели:</b> ' +
+            esc((s.answer || "").slice(0, 600)) + '</div>';
+        if (move.stage) {
+            html += '<div class="st-walk-move">переход → ' +
+                esc(move.stage) + (move.step ? (", шаг: " + esc(move.step)) : "") +
+                (move.expected ? (", ожидается: " + esc(move.expected)) : "") +
+                '</div>';
+        }
+        if (s.error) html += '<div class="st-walk-err">' + esc(s.error) + '</div>';
+        return html + '</div>';
+    }
+
+    // Проигрывает шаги LLM-прогона ПО ОДНОМУ с задержкой SELFTEST_STEP_DELAY.
+    function playLlmResult(d) {
+        if (!d || (d.steps || []).length === 0) {
+            return renderLlmResult(null);
+        }
+        var bubble = llmResultScaffold(d);
+        var steps = d.steps || [];
+        var i = 0;
+        function tick() {
+            if (i >= steps.length) {
+                // Финал: полоска этапов + итоговая сводка.
+                var fin = d.final || {};
+                var finHtml = stageBarHtml(STAGES_DEFAULT, STAGE_LABELS_DEFAULT,
+                    fin.stage, STAGES_DEFAULT.indexOf(fin.stage) - 1);
+                var okAll = !!d.ok;
+                finHtml += '<div class="st-summary ' + (okAll ? "ok" : "fail") +
+                    '">' + (okAll ? "Задача доведена до этапа «завершено»."
+                    : "Прогон завершён не на этапе «завершено».") + '</div>';
+                bubble.querySelector(".bubble").insertAdjacentHTML("beforeend", finHtml);
+                streamEl.scrollTop = streamEl.scrollHeight;
+                return;
+            }
+            var s = steps[i];
+            // Обновляем прогресс-бар (если у шага задана готовность).
+            if (typeof s.progress === "number") {
+                var wrap = bubble.querySelector(".st-progress-wrap");
+                if (wrap) {
+                    wrap.querySelector(".st-progress-fill").style.width = s.progress + "%";
+                    wrap.querySelector(".st-progress-label").textContent =
+                        "готовность: " + s.progress + "% · пауза на " +
+                        (d.pause_at != null ? d.pause_at : 35) + "%";
+                }
+            }
+            bubble.querySelector(".bubble").insertAdjacentHTML("beforeend", llmStepHtml(s));
+            streamEl.scrollTop = streamEl.scrollHeight;
+            i++;
+            setTimeout(tick, SELFTEST_STEP_DELAY);
+        }
+        setTimeout(tick, SELFTEST_STEP_DELAY);
+    }
+
+    // ---- Режим logic: автономный тест (секции + проверки OK/FAIL) ----
+    function renderLogicResult(d) {
+        var html = selftestHeaderHtml("Тест автомата задачи",
+            d && d.mode === "logic" ? "автономный прогон check_task_state.py" : "");
+        if (!d) {
+            return pushAssistantHtml(html +
+                '<div class="st-err">Нет ответа от сервера.</div>');
+        }
+        var okAll = !!d.ok;
+        html += '<div class="st-summary ' + (okAll ? "ok" : "fail") + '">' +
+            (okAll ? ("ИТОГ: " + d.passed + " OK, 0 FAIL")
+                   : ("ИТОГ: " + (d.passed || 0) + " OK, " +
+                      (d.failed || 0) + " FAIL")) + '</div>';
+        if (d.error) html += '<div class="st-err">' + esc(d.error) + '</div>';
+        (d.sections || []).forEach(function (sec) {
+            html += '<div class="st-section">' + esc(sec.name || "—") + '</div>';
+            (sec.steps || []).forEach(function (st) {
+                var ok = st.status === "ok";
+                html += '<div class="st-step ' + (ok ? "ok" : "fail") + '">' +
+                    '<span class="st-mark">' + (ok ? "✔" : "✘") + '</span>' +
+                    '<span class="st-text">' + esc(st.title || "") +
+                    (st.detail ? ' <span class="st-detail">(' +
+                        esc(st.detail) + ')</span>' : "") + '</span></div>';
+            });
+        });
+        return pushAssistantHtml(html);
+    }
+
+    // ---- Режим llm: прохождение задачи выбранной моделью ----
+    function renderLlmResult(d) {
+        var html = selftestHeaderHtml("Прогон задачи по этапам — выбранной моделью",
+            d && d.model ? ("модель: " + d.model) : "");
+        if (!d || (d.steps || []).length === 0) {
+            return pushAssistantHtml(html +
+                '<div class="st-err">' + esc((d && d.error) ||
+                "Прогон не дал результатов (проверьте доступность модели).") +
+                '</div>');
+        }
+        // Цель и итоговое состояние.
+        if (d.goal) {
+            html += '<div class="st-goal"><b>Цель:</b> ' + esc(d.goal) + '</div>';
+        }
+        var fin = d.final || {};
+        html += stageBarHtml(STAGES_DEFAULT, STAGE_LABELS_DEFAULT,
+            fin.stage, STAGES_DEFAULT.indexOf(fin.stage) - 1);
+        if (d.error) html += '<div class="st-err">' + esc(d.error) + '</div>';
+
+        (d.steps || []).forEach(function (s) { html += llmStepHtml(s); });
+        var okAll = !!d.ok;
+        html += '<div class="st-summary ' + (okAll ? "ok" : "fail") + '">' +
+            (okAll ? "Задача доведена до этапа «завершено»."
+                   : "Прогон завершён не на этапе «завершено».") + '</div>';
+        return pushAssistantHtml(html);
+    }
+
+    // Запускает прогон теста на сервере и показывает результат в окне ответов.
+    function runTaskSelfTest(mode) {
+        var btn = (mode === "llm") ? taskSelftestLlmBtn : taskSelftestBtn;
+        if (btn) btn.disabled = true;
+        var goal = (taskGoalInp && taskGoalInp.value.trim()) ||
+            (taskState && taskState.goal) || "Разработка приложения на Qt + C++";
+        var model = firstSelectedModelLabel();
+        if (mode === "llm") {
+            setStatus("Прогон задачи по этапам моделью" +
+                (model ? (" «" + model + "»") : "") + "…", "");
+        } else {
+            setStatus("Запускаю тест автомата задачи…", "");
+        }
+        var body = { mode: mode, goal: goal, model: model };
+        fetch("/api/task/selftest", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify(body),
+        })
+        .then(function (r) { return r.json().catch(function () { return null; }); })
+        .then(function (d) {
+            if (mode === "llm") {
+                // Пошаговое отображение с задержкой между этапами.
+                playLlmResult(d);
+                if (d && d.ok) setStatus("Прогон по модели завершён: задача закрыта.", "ok");
+                else setStatus("Прогон по модели завершён (см. окно ответов).", "error");
+            } else {
+                renderLogicResult(d);
+                if (d && d.ok) setStatus("Тест автомата задачи пройден.", "ok");
+                else setStatus("Тест автомата задачи выявил ошибки.", "error");
+            }
+        })
+        .catch(function () {
+            if (mode === "llm") renderLlmResult(null);
+            else renderLogicResult(null);
+            setStatus("Не удалось запустить прогон.", "error");
+        })
+        .finally(function () { if (btn) btn.disabled = false; });
+    }
+
+    if (taskSelftestBtn) {
+        taskSelftestBtn.addEventListener("click", function () {
+            runTaskSelfTest("logic");
+        });
+    }
+    if (taskSelftestLlmBtn) {
+        taskSelftestLlmBtn.addEventListener("click", function () {
+            runTaskSelfTest("llm");
+        });
+    }
+
+    // ------------------------------------------------------------------
     // Статистика токенов в заголовке (текущая сессия)
     // ------------------------------------------------------------------
     // Суммарный расход токенов за сессию: tokIn — вход (запрос), tokOut — выход (ответ)
@@ -927,9 +1406,37 @@
     var profileModelSel = document.getElementById("profile-model");
     var profileCharInp = document.getElementById("profile-character");
     var profileStyleInp = document.getElementById("profile-style");
-    var profileCreateBtn = document.getElementById("profile-create");
+    var profileForm = document.getElementById("profiles-form");
+    var profileNewBtn = document.getElementById("profile-new");
+    var profileSaveBtn = document.getElementById("profile-save");
+    var profileCancelBtn = document.getElementById("profile-cancel");
     // Текущий список профилей и id активного (снимок сервера).
     var profilesState = { profiles: [], active: null };
+
+    // Раскрывает форму создания профиля (поля + кнопки) и скрывает кнопку
+    // «Создать профиль». Соответствует логике: старт — только кнопка; после
+    // нажатия появляются поля.
+    function openProfileForm() {
+        if (profileForm) profileForm.hidden = false;
+        if (profileNewBtn) profileNewBtn.hidden = true;
+        if (profileNameInp) profileNameInp.focus();
+    }
+
+    // Сворачивает форму обратно к кнопке «Создать профиль» и очищает поля.
+    function closeProfileForm() {
+        if (profileForm) profileForm.hidden = true;
+        if (profileNewBtn) profileNewBtn.hidden = false;
+        if (profileNameInp) profileNameInp.value = "";
+        if (profileCharInp) profileCharInp.value = "";
+        if (profileStyleInp) profileStyleInp.value = "";
+        if (profileModelSel) profileModelSel.value = "";
+    }
+
+    // Возвращает первую букву имени для аватарки.
+    function profileInitial(name) {
+        var s = String(name || "").trim();
+        return s ? s.charAt(0).toUpperCase() : "?";
+    }
 
     // Заполняет выпадающий список моделей в форме создания персоны.
     function fillProfileModelSelect(labels) {
@@ -971,8 +1478,7 @@
         if (!list.length) {
             var empty = document.createElement("div");
             empty.className = "profiles-empty";
-            empty.textContent = "Профилей пока нет. Создайте профиль ниже — " +
-                "он задаёт системный промпт для ответа.";
+            empty.textContent = "Профилей пока нет. Нажмите «Создать профиль».";
             profilesBox.appendChild(empty);
             updateModelBarMode();
             return;
@@ -981,6 +1487,12 @@
             var row = document.createElement("div");
             row.className = "profile-row" + (p.active ? " active" : "");
             row.title = "Клик — переключиться на этот профиль";
+
+            // Аватарка (первая буква имени) — всегда видна в карточке профиля.
+            var avatar = document.createElement("span");
+            avatar.className = "p-avatar";
+            avatar.textContent = profileInitial(p.name);
+            row.appendChild(avatar);
 
             var name = document.createElement("span");
             name.className = "p-name";
@@ -1055,6 +1567,7 @@
         }
         if (d.memory) renderMemory(d.memory, null, true);
         if (d.branches) renderBranches(d.branches);
+        if (d.task) renderTask(d.task);
         if (d.compact) applyCompactFromServer(d.compact);
         if (d.strategy) applyStrategyFromServer(d.strategy);
         if (d.context) applyContextStats(d.context);
@@ -1083,8 +1596,17 @@
         .catch(function () { setStatus("Ошибка связи с профилями.", "error"); });
     }
 
-    if (profileCreateBtn) {
-        profileCreateBtn.addEventListener("click", function () {
+    // Логика формы создания профиля:
+    //   «Создать профиль» -> раскрыть поля -> «Сохранить профиль» -> создать
+    //   профиль (карточка с аватаркой) и свернуть форму обратно к кнопке.
+    if (profileNewBtn) {
+        profileNewBtn.addEventListener("click", openProfileForm);
+    }
+    if (profileCancelBtn) {
+        profileCancelBtn.addEventListener("click", closeProfileForm);
+    }
+    if (profileSaveBtn) {
+        profileSaveBtn.addEventListener("click", function () {
             var name = profileNameInp ? profileNameInp.value.trim() : "";
             if (!name) { setStatus("Введите имя профиля.", "error"); return; }
             profileAction({
@@ -1094,9 +1616,8 @@
                 character: profileCharInp ? profileCharInp.value.trim() : "",
                 style: profileStyleInp ? profileStyleInp.value.trim() : "",
             });
-            if (profileNameInp) profileNameInp.value = "";
-            if (profileCharInp) profileCharInp.value = "";
-            if (profileStyleInp) profileStyleInp.value = "";
+            // После сохранения форму сворачиваем — остаётся только карточка.
+            closeProfileForm();
         });
     }
 
@@ -1182,6 +1703,7 @@
             if (data.memory) renderMemory(data.memory);
             if (data.facts) renderFacts(data.facts);
             if (data.branches) renderBranches(data.branches);
+            if (data.task) renderTask(data.task);
             renderTrace(data.trace, data.meta);
         })
         .catch(function (err) { setStatus("Ошибка связи: " + err.message, "error"); })
@@ -1208,6 +1730,10 @@
         resetContextStats();
         render();
         renderTrace(null, null);
+        // Новый разговор сбрасывает и состояние задачи (см. /api/newchat).
+        renderTask({ active: false, stage: "planning", paused: false,
+                     stages: ["planning", "execution", "validation", "done"],
+                     stage_labels: taskState.stage_labels || {} });
         setStatus(statusText, "ok");
         qEl.focus();
     }
@@ -1226,6 +1752,7 @@
                     renderMemory(d.memory);
                     renderFacts(d.facts);
                     renderBranches(d.branches);
+                    if (d.task) renderTask(d.task);
                     // накапливаем статистику токенов из сохранённой истории
                     tokIn = 0;
                     tokOut = 0;
@@ -1308,6 +1835,10 @@
     renderBranches({ branches: [{ name: "main", size: 0 }], active_branch: 0 });
     renderMemory({ short: { items: 0, branches: 1 },
                    working: {}, longterm: {} });
+    renderTask({ active: false, stage: "planning", paused: false,
+                 stages: ["planning", "execution", "validation", "done"],
+                 stage_labels: { planning: "планирование", execution: "выполнение",
+                                 validation: "проверка", done: "завершено" } });
     // Загружаем историю с сервера (если она есть на диске).
     // ------------------------------------------------------------------
     // Левая колонка: автоподгонка ширины под содержимое
