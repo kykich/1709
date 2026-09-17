@@ -161,7 +161,8 @@ class Agent:
         return chosen
 
     def answer(self, question, history=None, selected=None, max_tokens=None,
-               compact=None, memory=None, profile=None, answer_title=None):
+               compact=None, memory=None, profile=None, answer_title=None,
+               task_state=None):
         """Обрабатывает запрос пользователя и возвращает результат.
 
         Принимает:
@@ -186,6 +187,11 @@ class Agent:
             answer_title — строка-заголовок блока ответа. Если задана (ответ
                       даёт персона) — в шапке карточки показывается имя
                       персоны, а не метка модели.
+            task_state — dict формализованного состояния задачи (Task State
+                      Machine) или None: цель, этап (planning/execution/
+                      validation/done), текущий шаг, ожидаемое действие и
+                      признак паузы. Подставляется в системный промпт, чтобы
+                      агент продолжал задачу без повторных объяснений.
         Возвращает dict, единообразный для успеха и ошибок:
             ok      — True, если хотя бы одна модель ответила;
             text    — текстовое представление ответов;
@@ -229,16 +235,22 @@ class Agent:
                           "title": "Агент: контекст уже сжат (summary + последние)",
                           "detail": "сжатие применено на сервере, повторно не выполняется"})
 
-        messages = self._build_messages(history, question, profile=profile)
+        messages = self._build_messages(history, question, profile=profile,
+                                        task_state=task_state)
         hlen = len(history) if isinstance(history, list) else 0
         prof_note = ""
         if isinstance(profile, dict) and (profile.get("character")
                                           or profile.get("style")):
             prof_note = " | профиль: %s" % (profile.get("name") or "без имени")
+        task_note = ""
+        if isinstance(task_state, dict) and task_state.get("active"):
+            task_note = " | задача: %s%s" % (
+                task_state.get("stage", ""),
+                " (пауза)" if task_state.get("paused") else "")
         trace.append({"kind": "act", "title": "Агент собрал сообщения для API",
                       "detail": "%d сообщений (%d из истории + текущий) | системный "
-                                "промпт добавлен%s" % (len(messages), hlen,
-                                                       prof_note)})
+                                "промпт добавлен%s%s" % (len(messages), hlen,
+                                                         prof_note, task_note)})
         print("[TRACE] Agent.answer() собрал %d сообщений для API" % len(messages),
               flush=True)
 
@@ -378,25 +390,332 @@ class Agent:
             head += " («%s»)" % name
         return head + ": " + " ".join(parts)
 
-    def _build_messages(self, history, question, profile=None):
+    @staticmethod
+    def task_system_prompt(task_state):
+        """Собирает блок системного промпта из формализованного состояния задачи.
+
+        task_state — dict (см. rtk_app.task_state.TaskState) или None.
+        Возвращает строку-инструкцию либо "" (если задачи нет).
+
+        Блок описывает цель, текущий этап (planning/execution/validation/
+        done), текущий шаг и ожидаемое действие. Если задача НА ПАУЗЕ — явно
+        указываем агенту продолжить с того же этапа/шага, НЕ прося
+        пользователя объяснять задачу заново.
+        """
+        try:
+            from .task_state import TaskState
+            ts = TaskState(task_state)
+        except Exception:
+            return ""
+        if not ts.active:
+            return ""
+        block = ts.system_prompt_block()
+        # Инструкция: сообразовывать ответ с текущим этапом задачи.
+        block += ("\nИнструкция: веди ответ сообразно этапу и шагу задачи; "
+                  "если задача на паузе — по запросу продолжай с текущего "
+                  "места, не требуя повторно объяснять задачу.")
+        return block
+
+    def advance_task(self, task_state, question, answer="", model=None):
+        """Определяет ПЕРЕХОД состояния задачи по ходу пользователя.
+
+        Задаёт модели (по умолчанию GigaChat, либо переданную в model)
+        вопрос: какой следующий этап/шаг у задачи, исходя из текущего
+        состояния и нового сообщения. Возвращает dict:
+            {"stage": "execution"|…, "step": "…", "expected": "…",
+             "note": "…"} — предлагаемый переход; либо {} при неудаче.
+
+        Агент сам НЕ меняет состояние — решение о применении перехода
+        принимает вызывающий код (через SessionStore.advance_task, где
+        проверяется корректность перехода).
+        """
+        try:
+            from .task_state import TaskState, STAGES, STAGE_LABELS
+        except Exception:
+            return {}
+        ts = TaskState(task_state)
+        if not ts.active:
+            return {}
+        lines = [
+            "Ты управляешь конечным автоматом ЗАДАЧИ (этапы: planning ->",
+            "execution -> validation -> done). Определи НОВОЕ состояние",
+            "задачи после нового сообщения пользователя.",
+            "",
+            "Текущее состояние задачи:",
+            "Цель: %s" % (ts.goal or "не указана"),
+            "Этап: %s" % ts.stage,
+            "Шаг: %s" % (ts.step or "—"),
+            "Ожидаемое действие: %s" % (ts.expected or "—"),
+            "На паузе: %s" % ("да" if ts.paused else "нет"),
+            "",
+            "Новое сообщение пользователя: " + str(question or ""),
+        ]
+        if answer:
+            lines += ["", "Ответ ассистента (кратко): " + str(answer)[:500]]
+        lines += [
+            "",
+            "Верни СТРОГО JSON-объект с полями:",
+            '  "stage": один из planning|execution|validation|done;',
+            '  "step": краткое описание текущего шага;',
+            '  "expected": что ожидается дальше (действие/ввод);',
+            '  "note": короткое пояснение перехода.',
+            "Разрешённые переходы: planning->execution;",
+            "execution->validation; validation->done или validation->execution",
+            "(если проверка нашла недочёт). Этап может остаться тем же.",
+            "Только JSON, без пояснений и markdown.",
+        ]
+        prompt = "\n".join(lines)
+        provider, model_name = self._resolve_model(model)
+        try:
+            res = self._chat_text(provider, model_name, [
+                {"role": "system",
+                 "content": "Ты ведёшь состояние задачи и отвечаешь строго JSON."},
+                {"role": "user", "content": prompt},
+            ], temperature=0.1)
+            content = res.get("content", "") if isinstance(res, dict) else str(res)
+            data = parse_facts_json(content)
+            if not isinstance(data, dict):
+                return {}
+            stage = str(data.get("stage", "")).strip().lower()
+            if stage not in STAGES:
+                return {}
+            return {
+                "stage": stage,
+                "step": str(data.get("step", "") or ""),
+                "expected": str(data.get("expected", "") or ""),
+                "note": str(data.get("note", "") or ""),
+            }
+        except Exception as exc:
+            print("[TASK] не удалось определить переход: %s" % exc, flush=True)
+            return {}
+
+    def _resolve_model(self, model):
+        """Определяет (провайдер, имя модели) по метке или откатывается.
+
+        model — метка модели («GigaChat»/«DeepSeek-flash») либо имя модели,
+        либо None. Возвращает кортеж (provider, model_name). Если метка
+        неизвестна или не задана — используется GigaChat (модель по умолчанию
+        для задач состояния).
+        """
+        label = str(model or "").strip()
+        base = self.by_label.get(label)
+        if base is None:
+            # Может, передали ИМЯ модели, а не метку — поищем по имени.
+            for provider, name, _lbl, _cls in self.sources:
+                if name == label:
+                    return provider, name
+            return "gigachat", config.GC_MODEL
+        provider, name, _lbl, _cls = base
+        return provider, name
+
+    def _chat_text(self, provider, model, messages, temperature=None,
+                   max_tokens=None):
+        """Вызывает одну модель и возвращает её ответ (dict с content/tokens).
+
+        Единая точка для вспомогательных LLM-операций (состояние задачи,
+        summary, facts): выбирает провайдера по имени. Исключения всплывают
+        наружу — вызывающий код обрабатывает их сам.
+        """
+        if provider == "deepseek":
+            return deepseek.chat(self.api_key, messages, model=model,
+                                 temperature=temperature, max_tokens=max_tokens)
+        return gigachat.chat(messages, model=model,
+                             temperature=temperature, max_tokens=max_tokens)
+
+    def walk_task_llm(self, goal, model=None, scenario=None, pause_at=35):
+        """Проводит ЗАДАЧУ по этапам автомата силами ВЫБРАННОЙ модели.
+
+        Наглядно демонстрирует, как агент ведёт задачу конечным автоматом:
+        на каждом шаге модели передаётся текущее состояние и реплика
+        пользователя, модель отвечает и предлагает переход автомата, а переход
+        принимается ЛИБО отклоняется по правилам (некорректный переход не
+        применяется).
+
+        goal     — цель задачи (например, «Разработка приложения Qt + C++»).
+        model    — метка выбранной модели (None → GigaChat по умолчанию).
+        scenario — список реплик пользователя по шагам. Если None — берётся
+                   типовой сценарий разработки (можно переопределить).
+        pause_at — процент готовности, на котором задача ставится НА ПАУЗУ
+                   (по умолчанию 35%). Пауза вставляется между шагами, когда
+                   достигнутая готовность впервые достигает этого порога, и
+                   сразу же снимается (resume) — демонстрация того, что после
+                   продолжения работа идёт с ТОГО ЖЕ этапа/шага.
+
+        Возвращает dict:
+            ok          — прогон завершён (дошли до done) без сбоев;
+            model       — фактически использованная модель;
+            goal        — цель;
+            steps       — [{n, kind, progress, stage_before, user, answer,
+                            move, accepted, stage_after, error, paused} …] —
+                          прохождение по шагам (kind="step"|"pause"|"resume");
+            final       — итоговое состояние задачи (dict);
+            pause_at    — порог паузы (%), фактически применённый;
+            paused_at   — готовность (%), на которой вставали на паузу;
+            error       — сообщение об ошибке (если была).
+        """
+        from .task_state import TaskState, STAGE_LABELS
+        provider, model_name = self._resolve_model(model)
+        model_label = model or config.GC_MODEL
+        for _p, name, lbl, _c in self.sources:
+            if name == model_name:
+                model_label = lbl
+                break
+
+        if scenario is None:
+            scenario = [
+                "Начинаем. Согласуй, пожалуйста, требования и план работ.",
+                "Требования приняты — приступай к реализации (код, сборка).",
+                "Реализация готова — переходи к сборке и тестированию.",
+                "Проверка нашла дефект — вернись к доработке.",
+                "Дефект исправлен — подтверди готовность и заверши задачу.",
+            ]
+
+        # Порог паузы в процентах (ограничиваем разумным диапазоном).
+        try:
+            pause_at = float(pause_at)
+        except (TypeError, ValueError):
+            pause_at = 35.0
+        pause_at = max(0.0, min(100.0, pause_at))
+
+        ts = TaskState()
+        ts.start(goal, step="согласование требований",
+                 expected="утвердить план")
+        steps = []
+        error = None
+        paused_at = None
+        total = len(scenario)
+
+        for i, user_msg in enumerate(scenario, 1):
+            stage_before = ts.stage
+            # Готовность к КОНЦУ этого шага (в %): i из total.
+            progress = int(round(i * 100.0 / total)) if total else 0
+
+            # --- ПАУЗА на пороге готовности (перед выполнением шага) ---
+            # Вставляем паузу в тот момент, когда готовность ВПЕРВЫЕ достигает
+            # порога pause_at: до шага < порога, а к концу шага >= порога.
+            before_progress = int(round((i - 1) * 100.0 / total)) if total else 0
+            if (paused_at is None and pause_at > 0
+                    and before_progress < pause_at <= progress
+                    and ts.is_active() and ts.stage != "done"):
+                ok_p, _ = ts.pause("пауза на %d%% готовности" % before_progress)
+                if ok_p:
+                    paused_at = before_progress
+                    steps.append({
+                        "n": i, "kind": "pause",
+                        "progress": before_progress,
+                        "stage_before": ts.stage,
+                        "stage_label": STAGE_LABELS.get(ts.stage, ts.stage),
+                        "user": "", "answer": "",
+                        "move": {}, "accepted": True,
+                        "stage_after": ts.stage, "error": None,
+                        "paused": True,
+                        "note": "пауза на %d%% готовности" % before_progress,
+                    })
+                    # Сразу снимаем паузу — показываем, что продолжение идёт
+                    # с ТОГО ЖЕ этапа/шага (без повторных объяснений).
+                    ok_r, _ = ts.resume("продолжение с того же этапа/шага")
+                    steps.append({
+                        "n": i, "kind": "resume",
+                        "progress": before_progress,
+                        "stage_before": ts.stage,
+                        "stage_label": STAGE_LABELS.get(ts.stage, ts.stage),
+                        "user": "", "answer": "",
+                        "move": {}, "accepted": bool(ok_r),
+                        "stage_after": ts.stage, "error": None,
+                        "paused": False,
+                        "note": "продолжение с того же этапа/шага",
+                    })
+
+            # 1) Ответ модели по текущему состоянию задачи.
+            answer = ""
+            try:
+                sys_prompt = self.task_system_prompt(ts.to_dict()) or SYSTEM_PROMPT
+                res = self._chat_text(provider, model_name, [
+                    {"role": "system", "content": sys_prompt},
+                    {"role": "user", "content": user_msg},
+                ], temperature=0.3)
+                answer = (res.get("content", "") if isinstance(res, dict)
+                          else str(res))
+            except Exception as exc:
+                error = "Модель недоступна: %s" % exc
+                steps.append({
+                    "n": i, "kind": "step", "progress": progress,
+                    "stage_before": stage_before, "user": user_msg,
+                    "answer": "", "move": {}, "accepted": False,
+                    "stage_after": ts.stage, "error": str(exc),
+                    "paused": False,
+                })
+                break
+
+            # 2) Модель предлагает переход автомата.
+            move = self.advance_task(ts.to_dict(), user_msg, answer,
+                                     model=model_label)
+            accepted = False
+            err = None
+            if move and move.get("stage"):
+                # Применяем переход ТОЛЬКО если он корректен (проверка в TaskState).
+                ok, detail = ts.advance(move.get("stage"),
+                                        step=move.get("step"),
+                                        expected=move.get("expected"),
+                                        note=move.get("note") or "переход от LLM")
+                accepted = bool(ok)
+                if not ok:
+                    err = detail
+            else:
+                err = "Модель не предложила корректный переход."
+
+            steps.append({
+                "n": i, "kind": "step", "progress": progress,
+                "stage_before": stage_before,
+                "stage_label": STAGE_LABELS.get(stage_before, stage_before),
+                "user": user_msg,
+                "answer": answer,
+                "move": move or {},
+                "accepted": accepted,
+                "stage_after": ts.stage,
+                "stage_after_label": STAGE_LABELS.get(ts.stage, ts.stage),
+                "error": err,
+                "paused": False,
+            })
+            if ts.stage == "done":
+                break
+
+        return {
+            "ok": (error is None and ts.stage == "done"),
+            "model": model_label,
+            "provider": provider,
+            "goal": goal,
+            "steps": steps,
+            "final": ts.to_dict(),
+            "pause_at": int(pause_at),
+            "paused_at": paused_at,
+            "error": error,
+        }
+
+    def _build_messages(self, history, question, profile=None, task_state=None):
         """Собирает полный список сообщений для API (системный промпт + диалог).
 
         ВАЖНО: из истории сохраняются НЕ только user/assistant, но и
-        SYSTEM-сообщения (память агента и summary сжатия). Раньше они
-        отбрасывались, из-за чего модель НЕ получала память (рабочую и
-        долговременную) и summary — будто памяти не существует.
+        SYSTEM-сообщения (память агента, summary сжатия, состояние задачи).
+        Раньше они отбрасывались, из-за чего модель НЕ получала память
+        (рабочую и долговременную) и summary — будто памяти не существует.
 
-        Все системные сообщения (промпт агента + память + summary + профиль)
-        ОБЪЕДИНЯЮТСЯ в ОДНО ведущее system-сообщение: не все провайдеры
-        корректно принимают несколько system-сообщений, а GigaChat ожидает
-        системную инструкцию в начале. Диалог (user/assistant) идёт далее
-        в исходном порядке, затем — текущий вопрос пользователя.
+        Все системные сообщения (промпт агента + память + summary + профиль +
+        состояние задачи) ОБЪЕДИНЯЮТСЯ в ОДНО ведущее system-сообщение: не все
+        провайдеры корректно принимают несколько system-сообщений, а GigaChat
+        ожидает системную инструкцию в начале. Диалог (user/assistant) идёт
+        далее в исходном порядке, затем — текущий вопрос пользователя.
         """
         system_parts = [SYSTEM_PROMPT]
         # Характер/стиль профиля (персоны) — задают тон и формат ответов.
         prof_prompt = self.profile_system_prompt(profile)
         if prof_prompt:
             system_parts.append(prof_prompt)
+        # Формализованное состояние задачи (Task State Machine): этап, шаг,
+        # ожидаемое действие, пауза — чтобы агент продолжал задачу.
+        task_prompt = self.task_system_prompt(task_state)
+        if task_prompt:
+            system_parts.append(task_prompt)
         dialog = []
         if isinstance(history, list):
             for m in history:
