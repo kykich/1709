@@ -53,6 +53,7 @@ import threading
 import time
 
 from . import config
+from .task_state import TaskState
 
 __all__ = ["SessionStore"]
 
@@ -86,6 +87,9 @@ class SessionStore:
         # НЕ хранится — это и есть разделение типов (задание B1).
         self.memory_working = {}
         self.memory_longterm = {}
+        # СОСТОЯНИЕ ЗАДАЧИ (Task State Machine): формализованный автомат
+        # «этап -> шаг -> ожидаемое действие» с паузой/продолжением.
+        self.task_state = TaskState()
         # СЧЁТЧИКИ ИСПОЛЬЗОВАНИЯ памяти: сколько фрагментов ответов моделей
         # было заимствовано из рабочей/долговременной памяти (сумма за сессию).
         self.memory_use = {"working": 0, "longterm": 0}
@@ -134,6 +138,8 @@ class SessionStore:
             # Память профиля (изолирована от других профилей).
             "memory_working": {},
             "memory_longterm": {},
+            # Состояние задачи профиля (Task State Machine).
+            "task_state": {},
             # Диалог и ветки профиля.
             "messages": [],
             "branches": [{"name": "main", "messages": []}],
@@ -160,6 +166,7 @@ class SessionStore:
             if p["id"] == self.active_profile:
                 p["memory_working"] = dict(self.memory_working)
                 p["memory_longterm"] = dict(self.memory_longterm)
+                p["task_state"] = self.task_state.to_dict()
                 p["messages"] = list(self.messages)
                 p["branches"] = [{"name": b["name"],
                                   "messages": list(b["messages"])}
@@ -177,6 +184,7 @@ class SessionStore:
         self.active_profile = profile["id"]
         self.memory_working = dict(profile.get("memory_working") or {})
         self.memory_longterm = dict(profile.get("memory_longterm") or {})
+        self.task_state = TaskState(profile.get("task_state"))
         self.messages = list(profile.get("messages") or [])
         branches = profile.get("branches")
         if isinstance(branches, list) and branches:
@@ -219,6 +227,7 @@ class SessionStore:
         self.active_branch = 0
         self.memory_working = {}
         self.memory_longterm = {}
+        self.task_state = TaskState()
         self.memory_use = {"working": 0, "longterm": 0}
         self.memory_use_count = {"working": 0, "longterm": 0}
 
@@ -375,6 +384,7 @@ class SessionStore:
             self.active_branch = 0
             self.memory_working = {}
             self.memory_longterm = {}
+            self.task_state = TaskState()
             self.memory_use = {"working": 0, "longterm": 0}
             self.memory_use_count = {"working": 0, "longterm": 0}
             self.profiles = []
@@ -443,6 +453,10 @@ class SessionStore:
             ml = p.get("memory_longterm")
             if isinstance(ml, dict):
                 prof["memory_longterm"] = {str(k): str(v) for k, v in ml.items()}
+            # Состояние задачи профиля (Task State Machine).
+            ts = p.get("task_state")
+            if isinstance(ts, dict):
+                prof["task_state"] = TaskState(ts).to_dict()
             # Диалог.
             msgs = p.get("messages")
             if isinstance(msgs, list):
@@ -564,6 +578,10 @@ class SessionStore:
                 if legacy_facts and not self.memory_working \
                         and not self.memory_longterm:
                     self.memory_working = dict(legacy_facts)
+                # Состояние задачи (Task State Machine) из плоского поля.
+                task_state = data.get("task_state")
+                if isinstance(task_state, dict):
+                    self.task_state = TaskState(task_state)
                 # Счётчики использования памяти (за сессию).
                 mused = data.get("memory_use")
                 if isinstance(mused, dict):
@@ -692,6 +710,7 @@ class SessionStore:
             "active_branch": self.active_branch,
             "memory": {"working": dict(self.memory_working),
                        "longterm": dict(self.memory_longterm)},
+            "task_state": self.task_state.to_dict(),
             "memory_use": dict(self.memory_use),
             "memory_use_count": dict(self.memory_use_count),
         }
@@ -728,6 +747,7 @@ class SessionStore:
                 "active_branch": self.active_branch,
                 "memory": {"working": dict(self.memory_working),
                            "longterm": dict(self.memory_longterm)},
+                "task_state": self.task_state.to_dict(),
                 "memory_use": dict(self.memory_use),
                 "memory_use_count": dict(self.memory_use_count),
             }
@@ -753,6 +773,8 @@ class SessionStore:
             self.active_branch = 0
             # Рабочая память завершённой задачи больше не нужна.
             self.memory_working = {}
+            # Состояние задачи сбрасываем — начинается новый разговор.
+            self.task_state = TaskState()
             # Счётчики использования памяти — обнуляем для нового разговора.
             self.memory_use = {"working": 0, "longterm": 0}
             self.memory_use_count = {"working": 0, "longterm": 0}
@@ -979,6 +1001,12 @@ class SessionStore:
             mem_msg = self.memory_message()
             if mem_msg:
                 base = [mem_msg] + base
+            # СОСТОЯНИЕ ЗАДАЧИ: формализованный автомат (этап/шаг/ожидаемое
+            # действие + признак паузы) — тоже системным сообщением, чтобы
+            # агент продолжал задачу без повторных объяснений.
+            task_msg = self.task_message()
+            if task_msg:
+                base = [task_msg] + base
             # Сжатие summary — поверх выбранной стратегией истории.
             return self._apply_summary_over(base)
 
@@ -1227,6 +1255,100 @@ class SessionStore:
                          "слов/фраз; остальной текст — без маркеров.")
             return {"role": "system",
                     "content": "Память агента:\n" + "\n".join(lines)}
+
+    # ---- СОСТОЯНИЕ ЗАДАЧИ (Task State Machine) ----
+    #
+    # Формализованное состояние задачи хранится в self.task_state (объект
+    # TaskState) и входит в снимок активного профиля: у КАЖДОЙ персоны своя
+    # задача. Задача — автомат «этап (planning/execution/validation/done) ->
+    # текущий шаг -> ожидаемое действие» с паузой/продолжением.
+
+    def get_task_state(self):
+        """Снимок состояния задачи активного профиля (dict)."""
+        with self.lock:
+            return self.task_state.to_dict()
+
+    def set_task_state(self, data):
+        """Восстанавливает состояние задачи из dict и сохраняет."""
+        with self.lock:
+            self.task_state = TaskState(data)
+            self._save_locked()
+            return self.task_state.to_dict()
+
+    def start_task(self, goal, step="", expected="", stage="planning"):
+        """Заводит новую задачу (сбрасывает прежнюю) и сохраняет."""
+        with self.lock:
+            self.task_state.start(goal, step=step, expected=expected,
+                                  stage=stage)
+            self._save_locked()
+            return self.task_state.to_dict()
+
+    def advance_task(self, stage=None, step=None, expected=None, note=""):
+        """Переводит задачу на новый этап/шаг с проверкой корректности.
+
+        Возвращает dict с полями:
+            ok       — был ли переход допустим;
+            task     — снимок состояния задачи;
+            error    — текст ошибки, если переход отклонён (иначе None).
+        """
+        with self.lock:
+            ok, snap = self.task_state.advance(stage, step, expected, note)
+            if ok:
+                self._save_locked()
+            return {"ok": ok,
+                    "task": snap,
+                    "error": None if ok else self.task_state.note}
+
+    def pause_task(self, note=""):
+        """Ставит задачу на паузу (позиция сохраняется)."""
+        with self.lock:
+            ok, snap = self.task_state.pause(note)
+            if ok:
+                self._save_locked()
+            return {"ok": ok, "task": snap}
+
+    def resume_task(self, note=""):
+        """Снимает задачу с паузы (продолжаем с того же этапа/шага)."""
+        with self.lock:
+            ok, snap = self.task_state.resume(note)
+            if ok:
+                self._save_locked()
+            return {"ok": ok, "task": snap}
+
+    def finish_task(self, note=""):
+        """Завершает задачу (только из этапа validation)."""
+        with self.lock:
+            ok, snap = self.task_state.finish(note)
+            if ok:
+                self._save_locked()
+            return {"ok": ok,
+                    "task": snap,
+                    "error": None if ok else self.task_state.note}
+
+    def reset_task(self):
+        """Полностью сбрасывает состояние задачи активного профиля."""
+        with self.lock:
+            snap = self.task_state.reset()
+            self._save_locked()
+            return snap
+
+    def task_prompt_block(self):
+        """Блок системного промпта с формализованным состоянием задачи."""
+        with self.lock:
+            return self.task_state.system_prompt_block()
+
+    def task_message(self):
+        """Системное сообщение с состоянием задачи (или None).
+
+        Возвращает dict-сообщение для передачи в контекст модели: благодаря
+        ему агент «помнит» этап/шаг/ожидаемое действие и после паузы
+        продолжает работу без повторных объяснений.
+        """
+        with self.lock:
+            block = self.task_state.system_prompt_block()
+            if not block:
+                return None
+            return {"role": "system", "content": block}
 
     # ---- Facts (key-value память) ----
     #
