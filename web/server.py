@@ -32,6 +32,14 @@ JSON-API:
                               (действия: set/delete/replace/clear, GET-снимок)
     POST /api/branches      - {action:"create"|"switch"|"delete"|"rename", …}
                               -> ветки (rename: {index, name})
+    POST /api/task          - состояние задачи (Task State Machine):
+                              {action:"start"|"advance"|"pause"|"resume"|
+                               "finish"|"reset"|"state", …} -> этап/шаг/
+                              ожидаемое действие (planning->execution->
+                              validation->done), пауза/продолжение.
+    POST /api/task/selftest - запустить автономный тест автомата задачи
+                              (check_task_state.py) и вернуть структурированный
+                              результат по шагам — для показа этапов на странице.
     GET  /api/profiles      - список профилей (персон) + активный
     POST /api/profiles      - {action:"create"|"switch"|"update"|"delete", …}
                               -> профили (персоны): при создании задаются
@@ -138,6 +146,7 @@ class WebRequestHandler(BaseHTTPRequestHandler):
                 "facts": self.session.get_facts(),
                 "branches": self.session.branches_state(),
                 "memory": self.session.memory_state(),
+                "task": self.session.get_task_state(),
                 "profiles": self.session.profiles_state(),
             })
         if path == "/api/profiles":
@@ -169,6 +178,10 @@ class WebRequestHandler(BaseHTTPRequestHandler):
             return self._handle_memory()
         if urllib.parse.urlparse(self.path).path == "/api/branches":
             return self._handle_branches()
+        if urllib.parse.urlparse(self.path).path == "/api/task":
+            return self._handle_task()
+        if urllib.parse.urlparse(self.path).path == "/api/task/selftest":
+            return self._handle_task_selftest()
         if urllib.parse.urlparse(self.path).path == "/api/profiles":
             return self._handle_profiles()
         self._send_json(404, {"ok": False, "error": "Not Found"})
@@ -310,12 +323,21 @@ class WebRequestHandler(BaseHTTPRequestHandler):
         # подставляются в системный промпт каждой модели (тон + формат/длина).
         # pid/pname/... и profile уже получены выше (см. выбор режима).
 
+        # СОСТОЯНИЕ ЗАДАЧИ (Task State Machine): формализованный автомат
+        # «этап -> шаг -> ожидаемое действие». Передаём его агенту, чтобы он
+        # вёл ответ сообразно этапу и после паузы продолжал без повторных
+        # объяснений. Если активной задачи нет — None.
+        task_state = self.session.get_task_state()
+        if not task_state.get("active"):
+            task_state = None
+
         result = self.agent.answer(question, history, selected,
                                    max_tokens=max_tokens,
                                    compact=compact,
                                    memory=memory,
                                    profile=profile,
-                                   answer_title=answer_title)
+                                   answer_title=answer_title,
+                                   task_state=task_state)
         if result.get("ok"):
             # По одному ходу на ответ модели с уже готовой разметкой
             self.session.append_turn(question, {
@@ -337,15 +359,51 @@ class WebRequestHandler(BaseHTTPRequestHandler):
             # Сжатие: если появились вытесненные сообщения — дописываем их
             # в summary (инкрементально; работает только при keep > 0).
             self._maybe_auto_compact()
+            # СОСТОЯНИЕ ЗАДАЧИ: если задача активна (не на паузе и не done) —
+            # пусть агент предложит следующий переход автомата, а сервер
+            # применит его ТОЛЬКО если переход корректен (проверка в
+            # SessionStore.advance_task). Паузу и завершение клиент задаёт сам.
+            self._maybe_advance_task(question, result)
             result["compact"] = self.session.get_compact()
             result["strategy"] = self.session.get_strategy()
             result["facts"] = self.session.get_facts()
             result["branches"] = self.session.branches_state()
             result["memory"] = self.session.memory_state()
+            result["task"] = self.session.get_task_state()
             # Статистика управления контекстом (сжатых/использованных из
             # summary сообщений) для панели интерфейса.
             result["context"] = self.session.context_stats()
         return self._send_json(200, result)
+
+    def _maybe_advance_task(self, question, result):
+        """Продвигает автомат задачи по ходу пользователя (если задача активна).
+
+        Решение о переходе принимает агент (LLM на GigaChat), а сервер
+        применяет его только при КОРРЕКТНОСТИ перехода. Задача на паузе не
+        двигается — продолжение инициирует пользователь кнопкой «Продолжить».
+        """
+        try:
+            ts = self.session.get_task_state()
+            if not ts.get("active") or ts.get("paused") or ts.get("stage") == "done":
+                return
+            move = self.agent.advance_task(
+                ts, question, result.get("text", ""))
+            if not move or not move.get("stage"):
+                return
+            res = self.session.advance_task(
+                stage=move.get("stage"),
+                step=move.get("step"),
+                expected=move.get("expected"),
+                note=move.get("note") or "авто-переход по ходу диалога")
+            if res.get("ok"):
+                print("[TASK] этап -> %s (шаг: %s)"
+                      % (res["task"].get("stage"), res["task"].get("step")),
+                      flush=True)
+            else:
+                print("[TASK] переход отклонён: %s" % res.get("error"),
+                      flush=True)
+        except Exception as exc:
+            print("[TASK] авто-переход не удался: %s" % exc, flush=True)
 
     def _maybe_update_facts(self, question, result):
         """Обновляет блок facts после хода пользователя (стратегия Facts)."""
@@ -571,6 +629,197 @@ class WebRequestHandler(BaseHTTPRequestHandler):
             "branches": state,
             "messages": self.session.snapshot(),
         })
+
+    def _handle_task(self):
+        """Управление СОСТОЯНИЕМ ЗАДАЧИ (Task State Machine).
+
+        Задача — конечный автомат: этап (planning -> execution -> validation
+        -> done) + текущий шаг + ожидаемое действие. Поддерживает ПАУЗУ на
+        любом этапе и ПРОДОЛЖЕНИЕ без повторных объяснений (цель и журнал
+        сохраняются).
+
+        Ожидаемые поля: action =
+            "start"   -> {goal, step?, expected?}   завести новую задачу;
+            "advance" -> {stage?, step?, expected?, note?}  корректный переход;
+            "pause"   -> {note?}                     поставить на паузу;
+            "resume"  -> {note?}                     снять с паузы (продолжить);
+            "finish"  -> {note?}                     завершить (из validation);
+            "reset"                                  сбросить состояние;
+            "state"                                  вернуть снимок (по умолч.).
+        """
+        data = self._read_json_body()
+        if not data:
+            # GET-подобный вызов (без тела) — просто отдаём состояние.
+            return self._send_json(200, {
+                "ok": True, "task": self.session.get_task_state()})
+        action = str(data.get("action", "state")).strip().lower()
+        try:
+            if action == "start":
+                task = self.session.start_task(
+                    data.get("goal"), step=data.get("step", ""),
+                    expected=data.get("expected", ""),
+                    stage=data.get("stage", "planning"))
+                return self._send_json(200, {"ok": True, "task": task})
+            if action == "advance":
+                res = self.session.advance_task(
+                    stage=data.get("stage"), step=data.get("step"),
+                    expected=data.get("expected"), note=data.get("note", ""))
+                status = 200 if res.get("ok") else 409
+                return self._send_json(status, {
+                    "ok": res.get("ok"), "task": res.get("task"),
+                    "error": res.get("error")})
+            if action == "pause":
+                res = self.session.pause_task(data.get("note", ""))
+                return self._send_json(200, {"ok": res.get("ok"),
+                                             "task": res.get("task")})
+            if action == "resume":
+                res = self.session.resume_task(data.get("note", ""))
+                return self._send_json(200, {"ok": res.get("ok"),
+                                             "task": res.get("task")})
+            if action == "finish":
+                res = self.session.finish_task(data.get("note", ""))
+                status = 200 if res.get("ok") else 409
+                return self._send_json(status, {
+                    "ok": res.get("ok"), "task": res.get("task"),
+                    "error": res.get("error")})
+            if action == "reset":
+                task = self.session.reset_task()
+                return self._send_json(200, {"ok": True, "task": task})
+            # action == "state" и всё прочее.
+            return self._send_json(200, {
+                "ok": True, "task": self.session.get_task_state()})
+        except ValueError as exc:
+            return self._send_json(400, {"ok": False, "error": str(exc)})
+        except Exception as exc:
+            return self._send_json(500, {
+                "ok": False, "error": "Ошибка состояния задачи: %s" % exc})
+
+    def _handle_task_selftest(self):
+        """Прогон автомата задачи для показа этапов НА СТРАНИЦЕ.
+
+        Поддерживает два режима (по полю mode в теле запроса):
+          * "logic" (по умолчанию) — запускает автономный тест
+            check_task_state.py отдельным процессом и парсит вывод в шаги
+            (секции + проверки OK/FAIL). Быстро, без сети/LLM;
+          * "llm" — проводит задачу по этапам СИЛАМИ ВЫБРАННОЙ МОДЕЛИ:
+            {goal, model} → агент.walk_task_llm(); возвращает прохождение
+            по шагам (реплика → ответ модели → предложенный переход →
+            принят/отклонён по правилам автомата).
+
+        Общий ответ: {ok, mode, …}. Для mode=llm добавляются goal, model,
+        steps, final.
+        """
+        data = self._read_json_body() or {}
+        mode = str(data.get("mode", "logic")).strip().lower()
+
+        if mode == "llm":
+            return self._handle_task_selftest_llm(data)
+
+        # ---- mode "logic": автономный тест автомата (check_task_state.py) ----
+        import subprocess
+        import sys as _sys
+        root = config.BASE_DIR
+        script = os.path.join(root, "check_task_state.py")
+        if not os.path.isfile(script):
+            return self._send_json(500, {
+                "ok": False, "error": "Файл теста не найден: %s" % script})
+        try:
+            # ВАЖНО: дочерний процесс печатает в консольной кодировке ОС
+            # (на Windows это cp1251), а не в UTF-8. Принудительно задаём
+            # UTF-8 для stdout/stderr теста, иначе русский текст приходит
+            # «кракозябрами» (UTF-8 декодируется из cp1251-байтов).
+            env = dict(os.environ)
+            env["PYTHONIOENCODING"] = "utf-8"
+            env["PYTHONUTF8"] = "1"
+            proc = subprocess.run(
+                [_sys.executable, script],
+                cwd=root, capture_output=True, timeout=60, env=env)
+            out = (proc.stdout or b"").decode("utf-8", "replace")
+            err = (proc.stderr or b"").decode("utf-8", "replace")
+            rc = proc.returncode
+        except subprocess.TimeoutExpired:
+            return self._send_json(504, {
+                "ok": False, "error": "Тест не завершился за 60 секунд."})
+        except Exception as exc:
+            return self._send_json(500, {
+                "ok": False, "error": "Не удалось запустить тест: %s" % exc})
+
+        sections = []
+        cur = None
+        passed = failed = 0
+        total = 0
+        for line in out.splitlines():
+            s = line.rstrip()
+            stripped = s.strip()
+            if stripped.startswith("==") and stripped.endswith("=="):
+                name = stripped.strip("= ").strip()
+                cur = {"name": name, "steps": []}
+                sections.append(cur)
+                continue
+            if stripped.startswith("[OK]") or stripped.startswith("[FAIL]"):
+                status = "ok" if stripped.startswith("[OK]") else "fail"
+                body = stripped[4:].strip()
+                # Отделяем краткое пояснение после «—» (если есть).
+                detail = ""
+                for sep in ("\u2014", " - "):
+                    if sep in body:
+                        body, detail = body.split(sep, 1)
+                        body, detail = body.strip(), detail.strip()
+                        break
+                if status == "ok":
+                    passed += 1
+                else:
+                    failed += 1
+                total += 1
+                if cur is None:
+                    cur = {"name": "Тест", "steps": []}
+                    sections.append(cur)
+                cur["steps"].append({"status": status,
+                                     "title": body, "detail": detail})
+            elif stripped.startswith("Итог:"):
+                cur = None  # подпись итога собираем отдельно (см. ниже)
+
+        ok = (failed == 0 and total > 0 and rc == 0)
+        return self._send_json(200, {
+            "ok": ok,
+            "mode": "logic",
+            "total": total,
+            "passed": passed,
+            "failed": failed,
+            "returncode": rc,
+            "sections": sections,
+            "error": (None if ok else ("stderr: %s" % err.strip() if err.strip()
+                                       else "Есть проваленные проверки.")),
+        })
+
+    def _handle_task_selftest_llm(self, data):
+        """Прогон задачи по этапам силами ВЫБРАННОЙ МОДЕЛИ (mode=llm).
+
+        Ожидает: {goal (цель задачи), model (метка модели)}. Делегирует
+        прогон агенту (agent.walk_task_llm), который на каждом шаге
+        спрашивает модель об ответе и переходе автомата, а сервер применяет
+        переход только при его корректности. Возвращает пошаговый результат
+        для наглядного показа на странице.
+        """
+        goal = str(data.get("goal") or "").strip()
+        if not goal:
+            goal = "Разработка приложения на Qt + C++"
+        model = data.get("model")
+        if self.agent is None:
+            return self._send_json(503, {
+                "ok": False, "mode": "llm",
+                "error": "Агент недоступен (нет моделей/ключа).",
+                "goal": goal, "model": model, "steps": []})
+        try:
+            result = self.agent.walk_task_llm(
+                goal, model=model, pause_at=data.get("pause_at", 35))
+        except Exception as exc:
+            return self._send_json(500, {
+                "ok": False, "mode": "llm",
+                "error": "Прогон не удался: %s" % exc,
+                "goal": goal, "model": model, "steps": []})
+        result["mode"] = "llm"
+        return self._send_json(200, result)
 
     def _handle_profiles(self):
         """Управление ПРОФИЛЯМИ (персонами).
