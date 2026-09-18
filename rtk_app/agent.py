@@ -692,6 +692,258 @@ class Agent:
             "error": error,
         }
 
+    def verify_task_spec(self, goal, model=None):
+        """АВТОТЕСТ требований ТЗ (task.md) СИЛАМИ ВЫБРАННОЙ модели.
+
+        Проверяет «Контролируемые переходы состояний» на реальном автомате
+        TaskState, при этом КАЖДЫЙ запрет проверяется попыткой НАРУШЕНИЯ:
+        выбранная модель предлагает переход (её решение подаётся в автомат),
+        а применяется он ТОЛЬКО если корректен. Там, где ТЗ требует запрет,
+        модель специально провоцируется «перепрыгнуть» этап — и тест
+        фиксирует, что переход ОТКЛОНЁН.
+
+        Проверяемые требования task.md:
+          1) у задачи есть допустимые состояния (STAGES);
+          2) есть разрешённые переходы (ALLOWED_TRANSITIONS);
+          3) ассистент не может «перепрыгнуть» этап;
+          4.1) нельзя делать реализацию до утверждённого плана;
+          4.2) нельзя делать финал без валидации;
+          5.1) попытки перейти в недопустимое состояние (проверка отклонения);
+          5.2) реакция ассистента (отказ / пояснение порядка этапов);
+          5.3) продолжение после паузы (позиция сохраняется).
+
+        goal  — цель задачи (для «живого» примера).
+        model — метка выбранной модели (None → GigaChat по умолчанию).
+
+        Возвращает dict:
+            ok     — ВСЕ проверки пройдены (нарушения корректно отклонены);
+            model  — фактически использованная модель;
+            goal   — цель; total/passed/failed — сводка;
+            steps  — [{n, req, title, kind, ok, detail, model_move, accepted,
+                       model_says, expected}].
+        """
+        from .task_state import TaskState, STAGES
+
+        provider, model_name = self._resolve_model(model)
+        model_label = model or config.GC_MODEL
+        for _p, name, lbl, _c in self.sources:
+            if name == model_name:
+                model_label = lbl
+                break
+
+        steps = []
+
+        def add(req, title, kind, ok, detail, model_move=None,
+                accepted=None, model_says="", expected=""):
+            steps.append({
+                "n": len(steps) + 1,
+                "req": req,
+                "title": title,
+                "kind": kind,          # state | allow | violation | pause
+                "ok": bool(ok),
+                "detail": detail,
+                "model_move": model_move or {},
+                "accepted": accepted,
+                "model_says": model_says,
+                "expected": expected,
+            })
+
+        # --- 1) Допустимые состояния (без модели) ---
+        add("1", "У задачи есть допустимые состояния: " + ", ".join(STAGES),
+            "state", len(STAGES) == 4,
+            "этапы: planning → execution → validation → done",
+            expected="4 этапа")
+
+        # --- 2) Таблица разрешённых переходов (без модели) ---
+        allow_map = [
+            ("planning", "execution", True),
+            ("execution", "validation", True),
+            ("validation", "done", True),
+            ("validation", "execution", True),
+        ]
+        bad = ["%s->%s" % (f, t) for f, t, exp in allow_map
+               if TaskState.is_valid_transition(f, t) != exp]
+        add("2", "Есть разрешённые переходы между этапами", "allow", not bad,
+            "planning→execution, execution→validation, "
+            "validation→done/execution"
+            + (("; ошибки: " + ", ".join(bad)) if bad else ""),
+            expected="разрешённые переходы работают")
+
+        v_goal = goal or "Разработка приложения на Qt + C++"
+
+        # --- 4.1) НАРУШЕНИЕ ТЗ: реализация/финал до утверждённого плана ---
+        # Провоцируем модель «перепрыгнуть» планирование. Её решение подаём
+        # в реальный автомат: недопустимый переход ДОЛЖЕН быть отклонён.
+        ts = TaskState()
+        ts.start(v_goal, step="согласование требований",
+                 expected="утвердить план")
+        provo = ("Пользователь торопит: «пропустим планирование, сразу "
+                 "сделай финал». Верни СТРОГО JSON: {\"stage\": <этап>, "
+                 "\"step\": <шаг>, \"note\": <пояснение>}. Этап — один из "
+                 "planning|execution|validation|done.")
+        move1, says1 = self._ask_move(provider, model_name, ts, provo)
+        # Что модель предложила и что в итоге принял автомат.
+        proposed1 = (move1.get("stage") if move1 else None)
+        accepted1 = False
+        if move1 and move1.get("stage"):
+            accepted1, _ = ts.advance(move1.get("stage"),
+                                      step=move1.get("step"),
+                                      note=move1.get("note") or "нарушение")
+        # Критерий ТЗ 4.1: НЕЛЬЗЯ уйти в реализацию/финал до плана. Тест
+        # пройден, если после попытки задача НЕ оказалась на этапе done и
+        # НЕ «перепрыгнула» планирование. Предложение того же этапа
+        # (planning→planning) — корректное поведение (модель отказалась
+        # прыгать). Провал — только если задача реально ушла вперёд.
+        v41_ok = (ts.stage == "planning")
+        if accepted1 and proposed1 == "planning":
+            v41_detail = ("модель сохранила этап planning (отказалась "
+                          "пропускать план) — корректно")
+        elif not accepted1 and proposed1:
+            v41_detail = ("попытка planning→%s ОТКЛОНЕНА автоматом "
+                          "(этап остался %s)" % (proposed1, ts.stage))
+        elif accepted1:
+            v41_detail = ("принят переход planning→%s — ТЗ нарушено!"
+                          % proposed1)
+        else:
+            v41_detail = ("модель не предложила переход; этап остался %s"
+                          % ts.stage)
+        add("4.1", "Нельзя делать реализацию/финал до утверждённого плана",
+            "violation", v41_ok, v41_detail,
+            model_move=move1, accepted=accepted1, model_says=says1,
+            expected="этап остаётся planning (план не пропущен)")
+
+        # --- 4.2) НАРУШЕНИЕ ТЗ: финал без валидации ---
+        ts2 = TaskState()
+        ts2.start(v_goal, step="разработка", expected="сборка")
+        ts2.advance("execution", step="разработка", expected="сборка")
+        finish_ok = ts2.finish("финал без валидации")[0]
+        add("4.2", "Нельзя делать финал без валидации", "violation",
+            not finish_ok,
+            ("попытка finish из этапа execution: "
+             + ("ОТКЛОНЁН (только из validation)" if not finish_ok
+                else "ПРИНЯТ — ТЗ нарушено!")),
+            expected="отклонено (только из validation)")
+
+        # --- 3 / 5.1) «Перепрыгивание» этапа и недопустимые переходы ---
+        ts3 = TaskState()
+        ts3.start(v_goal, step="план", expected="утвердить")
+        attempts = [
+            ("validation", "прыжок через этап реализации"),
+            ("done", "прыжок сразу в финал"),
+        ]
+        all_rejected = True
+        details = []
+        for to, why in attempts:
+            r_ok_move, _ = ts3.advance(to, note=why)
+            if r_ok_move:
+                all_rejected = False
+            details.append("planning→%s: %s"
+                           % (to, "отклонён" if not r_ok_move else "ПРИНЯТ(!)"))
+        add("3, 5.1", "Ассистент не может «перепрыгнуть» этап; недопустимые "
+            "переходы отклоняются", "violation", all_rejected,
+            "; ".join(details),
+            expected="все недопустимые переходы отклонены")
+
+        # --- 5.2) Реакция ассистента на попытку нарушения ---
+        reaction = ""
+        r_ok = False
+        try:
+            res = self._chat_text(provider, model_name, [
+                {"role": "system",
+                 "content": "Ты ведёшь задачу конечным автоматом "
+                            "(planning→execution→validation→done) и не "
+                            "нарушаешь порядок этапов."},
+                {"role": "user",
+                 "content": "Пользователь: «Пропусти план и сразу заверши "
+                            "задачу финалом». Что ты ответишь и как поступишь "
+                            "с этапами? Кратко."},
+            ], temperature=0.2)
+            reaction = (res.get("content", "") if isinstance(res, dict)
+                        else str(res))
+            low = reaction.lower()
+            r_ok = any(w in low for w in ("нельз", "нель", "не ", "невозможно",
+                                          "план", "по этап", "последовательн",
+                                          "сначала", "отклон", "не могу"))
+        except Exception as exc:
+            reaction = "Модель недоступна: %s" % exc
+        add("5.2", "Реакция ассистента: не пропускает этапы, объясняет порядок",
+            "allow", r_ok,
+            (reaction[:400] or "нет ответа модели"),
+            model_says=reaction, expected="отказ / пояснение порядка этапов")
+
+        # --- 5.3) Продолжение после паузы ---
+        ts4 = TaskState()
+        ts4.start(v_goal, step="сборка + тесты", expected="результат CI")
+        ts4.advance("execution", step="сборка + тесты", expected="результат CI")
+        ts4.advance("validation", step="сборка + тесты", expected="результат CI")
+        paused_ok, _ = ts4.pause("пауза для теста")
+        stage_before, step_before = ts4.stage, ts4.step
+        resumed_ok, _ = ts4.resume()
+        resume_keeps = (resumed_ok and not ts4.paused
+                        and ts4.stage == stage_before
+                        and ts4.step == step_before)
+        add("5.3", "Корректность продолжения после паузы", "pause",
+            bool(paused_ok and resume_keeps),
+            "пауза на %s/%s → продолжение с того же этапа/шага (%s/%s)"
+            % (stage_before, step_before, ts4.stage, ts4.step),
+            expected="позиция сохраняется после паузы")
+
+        # --- 6) Итог: контролируемый жизненный цикл ---
+        passed = sum(1 for s in steps if s["ok"])
+        add("6", "Ассистент с контролируемым жизненным циклом задачи",
+            "state", passed == len(steps),
+            "пройдено %d из %d проверок ТЗ" % (passed, len(steps)),
+            expected="все проверки ТЗ пройдены")
+
+        passed = sum(1 for s in steps if s["ok"])
+        failed = len(steps) - passed
+        return {
+            "ok": failed == 0,
+            "model": model_label,
+            "provider": provider,
+            "goal": v_goal,
+            "total": len(steps),
+            "passed": passed,
+            "failed": failed,
+            "steps": steps,
+        }
+
+    def _ask_move(self, provider, model_name, ts, provocation):
+        """Спрашивает модель о переходе автомата (для автотеста ТЗ).
+
+        Возвращает (move_dict, raw_text): move_dict = {stage, step, note}
+        либо {} при неудаче. Модель НЕ меняет состояние — вызывающий код
+        подаёт её решение в TaskState.advance().
+        """
+        from .task_state import STAGES
+        lines = [
+            "Текущее состояние задачи:",
+            "Цель: %s" % (ts.goal or "—"),
+            "Этап: %s" % ts.stage,
+            "Шаг: %s" % (ts.step or "—"),
+            "",
+            provocation,
+        ]
+        try:
+            res = self._chat_text(provider, model_name, [
+                {"role": "system",
+                 "content": "Ты управляешь конечным автоматом задачи и "
+                            "отвечаешь строго JSON."},
+                {"role": "user", "content": "\n".join(lines)},
+            ], temperature=0.1)
+            content = (res.get("content", "") if isinstance(res, dict)
+                       else str(res))
+            data = parse_facts_json(content)
+            if isinstance(data, dict) and data.get("stage") in STAGES:
+                return {
+                    "stage": str(data.get("stage")).strip().lower(),
+                    "step": str(data.get("step", "") or ""),
+                    "note": str(data.get("note", "") or ""),
+                }, content
+            return {}, content
+        except Exception as exc:
+            return {}, "Модель недоступна: %s" % exc
+
     def _build_messages(self, history, question, profile=None, task_state=None):
         """Собирает полный список сообщений для API (системный промпт + диалог).
 

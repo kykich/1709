@@ -715,6 +715,9 @@ class WebRequestHandler(BaseHTTPRequestHandler):
         if mode == "llm":
             return self._handle_task_selftest_llm(data)
 
+        if mode == "spec":
+            return self._handle_task_selftest_spec(data)
+
         # ---- mode "logic": автономный тест автомата (check_task_state.py) ----
         import subprocess
         import sys as _sys
@@ -819,6 +822,34 @@ class WebRequestHandler(BaseHTTPRequestHandler):
                 "error": "Прогон не удался: %s" % exc,
                 "goal": goal, "model": model, "steps": []})
         result["mode"] = "llm"
+        return self._send_json(200, result)
+
+    def _handle_task_selftest_spec(self, data):
+        """Автотест требований ТЗ (task.md) СИЛАМИ ВЫБРАННОЙ МОДЕЛИ (mode=spec).
+
+        Ожидает: {goal (цель задачи), model (метка модели)}. Делегирует
+        прогон агенту (agent.verify_task_spec), который проверяет каждое
+        требование ТЗ на реальном автомате TaskState, ОТДЕЛЬНО проверяя
+        ЗАПРЕТЫ попыткой нарушения (недопустимый переход должен быть
+        отклонён). Возвращает пошаговый результат для показа на странице.
+        """
+        goal = str(data.get("goal") or "").strip()
+        if not goal:
+            goal = "Разработка приложения на Qt + C++"
+        model = data.get("model")
+        if self.agent is None:
+            return self._send_json(503, {
+                "ok": False, "mode": "spec",
+                "error": "Агент недоступен (нет моделей/ключа).",
+                "goal": goal, "model": model, "steps": []})
+        try:
+            result = self.agent.verify_task_spec(goal, model=model)
+        except Exception as exc:
+            return self._send_json(500, {
+                "ok": False, "mode": "spec",
+                "error": "Тест ТЗ не удался: %s" % exc,
+                "goal": goal, "model": model, "steps": []})
+        result["mode"] = "spec"
         return self._send_json(200, result)
 
     def _handle_profiles(self):

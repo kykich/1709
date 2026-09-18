@@ -807,6 +807,7 @@
     //             принятые/отклонённые переходы), наглядно по шагам.
     var taskSelftestBtn = document.getElementById("task-selftest");
     var taskSelftestLlmBtn = document.getElementById("task-selftest-llm");
+    var taskSelftestSpecBtn = document.getElementById("task-selftest-spec");
 
     // Метка выбранной модели (первая включённая) для прогона по модели.
     function firstSelectedModelLabel() {
@@ -1009,9 +1010,63 @@
         return pushAssistantHtml(html);
     }
 
+    // ---- Режим spec: автотест требований ТЗ (+ вариант нарушения) ----
+    // HTML одной проверки ТЗ. Для проверок-«нарушений» показываем ОСОБУЮ
+    // метку: тест ПРОЙДЕН, если недопустимый переход был ОТКЛОНЁН.
+    function specStepHtml(s) {
+        var ok = !!s.ok;
+        var kindCls = (s.kind === "violation") ? " violation" : "";
+        var html = '<div class="st-step ' + (ok ? "ok" : "fail") + kindCls + '">' +
+            '<span class="st-mark">' + (ok ? "✔" : "✘") + '</span>' +
+            '<span class="st-text">' +
+            '<span class="st-req">ТЗ ' + esc(s.req || "") + '</span> ' +
+            esc(s.title || "") +
+            (s.detail ? ' <span class="st-detail">(' + esc(s.detail) + ')</span>' : "") +
+            '</span></div>';
+        // Для «нарушений» дополнительно показываем, что предложила модель.
+        if (s.kind === "violation" && s.model_move && s.model_move.stage) {
+            html += '<div class="st-violation">' +
+                'вариант нарушения: модель предложила переход → <b>' +
+                esc(s.model_move.stage) + '</b> · ' +
+                (s.accepted ? '<span class="st-move bad">принят (ТЗ нарушено)</span>'
+                            : '<span class="st-move ok">отклонён автоматом</span>') +
+                '</div>';
+        }
+        if (s.kind === "allow" && s.model_says) {
+            html += '<div class="st-violation">ответ модели: ' +
+                esc(String(s.model_says).slice(0, 500)) + '</div>';
+        }
+        return html;
+    }
+
+    function renderSpecResult(d) {
+        var html = selftestHeaderHtml(
+            "Автотест требований ТЗ — выбранной моделью",
+            d && d.model ? ("модель: " + d.model + " · с вариантом нарушения ТЗ")
+                         : "с вариантом нарушения ТЗ");
+        if (!d) {
+            return pushAssistantHtml(html +
+                '<div class="st-err">Нет ответа от сервера.</div>');
+        }
+        var okAll = !!d.ok;
+        html += '<div class="st-summary ' + (okAll ? "ok" : "fail") + '">' +
+            (okAll ? ("ИТОГ: требования ТЗ соблюдены — " + d.passed +
+                      " проверок пройдено, нарушения корректно отклонены")
+                   : ("ИТОГ: " + (d.passed || 0) + " OK, " +
+                      (d.failed || 0) + " FAIL — ТЗ нарушено!")) + '</div>';
+        if (d.goal) {
+            html += '<div class="st-goal"><b>Цель проверки:</b> ' +
+                esc(d.goal) + '</div>';
+        }
+        if (d.error) html += '<div class="st-err">' + esc(d.error) + '</div>';
+        (d.steps || []).forEach(function (s) { html += specStepHtml(s); });
+        return pushAssistantHtml(html);
+    }
+
     // Запускает прогон теста на сервере и показывает результат в окне ответов.
     function runTaskSelfTest(mode) {
-        var btn = (mode === "llm") ? taskSelftestLlmBtn : taskSelftestBtn;
+        var btn = (mode === "llm") ? taskSelftestLlmBtn
+                : (mode === "spec" ? taskSelftestSpecBtn : taskSelftestBtn);
         if (btn) btn.disabled = true;
         var goal = (taskGoalInp && taskGoalInp.value.trim()) ||
             (taskState && taskState.goal) || "Разработка приложения на Qt + C++";
@@ -1019,6 +1074,10 @@
         if (mode === "llm") {
             setStatus("Прогон задачи по этапам моделью" +
                 (model ? (" «" + model + "»") : "") + "…", "");
+        } else if (mode === "spec") {
+            setStatus("Автотест требований ТЗ моделью" +
+                (model ? (" «" + model + "»") : "") +
+                " (с вариантом нарушения)…", "");
         } else {
             setStatus("Запускаю тест автомата задачи…", "");
         }
@@ -1035,6 +1094,10 @@
                 playLlmResult(d);
                 if (d && d.ok) setStatus("Прогон по модели завершён: задача закрыта.", "ok");
                 else setStatus("Прогон по модели завершён (см. окно ответов).", "error");
+            } else if (mode === "spec") {
+                renderSpecResult(d);
+                if (d && d.ok) setStatus("Тест ТЗ пройден: требования соблюдены, нарушения отклонены.", "ok");
+                else setStatus("Тест ТЗ выявил нарушения требований.", "error");
             } else {
                 renderLogicResult(d);
                 if (d && d.ok) setStatus("Тест автомата задачи пройден.", "ok");
@@ -1043,6 +1106,7 @@
         })
         .catch(function () {
             if (mode === "llm") renderLlmResult(null);
+            else if (mode === "spec") renderSpecResult(null);
             else renderLogicResult(null);
             setStatus("Не удалось запустить прогон.", "error");
         })
@@ -1057,6 +1121,11 @@
     if (taskSelftestLlmBtn) {
         taskSelftestLlmBtn.addEventListener("click", function () {
             runTaskSelfTest("llm");
+        });
+    }
+    if (taskSelftestSpecBtn) {
+        taskSelftestSpecBtn.addEventListener("click", function () {
+            runTaskSelfTest("spec");
         });
     }
 

@@ -1283,6 +1283,26 @@ body { font-family: 'Segoe UI', Arial, sans-serif; color: var(--text); overflow:
 .st-step .st-text { flex: 1 1 auto; word-break: break-word; }
 .st-step .st-detail { color: #8a92a6; font-style: italic; }
 .st-err { color: #ffb9c2; margin: 4px 0; }
+/* Автотест ТЗ: метка номера требования и блок «вариант нарушения». */
+.st-step .st-req {
+    display: inline-block;
+    font-size: .64rem;
+    font-weight: 700;
+    color: #cdd5ea;
+    background: #2b3247;
+    border-radius: 4px;
+    padding: 0 5px;
+    margin-right: 4px;
+    white-space: nowrap;
+}
+.st-step.violation .st-req { background: #3a2b47; color: #f0c2ff; }
+.st-violation {
+    font-size: .74rem;
+    color: #b7c0d8;
+    margin: 2px 0 4px 18px;
+    padding-left: 8px;
+    border-left: 2px solid #4a5270;
+}
 /* Полоска этапов автомата (planning → … → done). */
 .st-stagebar {
     display: flex;
