@@ -1369,3 +1369,58 @@ body { font-family: 'Segoe UI', Arial, sans-serif; color: var(--text); overflow:
 
 
 
+
+/* ===== Математические формулы (LaTeX -> HTML/CSS) ===== */
+/* Готовый HTML формул строит сервер (rtk_app/html_report.py) без внешних
+   библиотек — здесь только оформление. Строчная формула идёт в строке
+   текста, выключная — отдельным блоком по центру. Формулы наследуют цвет
+   текста родителя. */
+.math-inline { white-space: nowrap; }
+.math-display {
+    display: block;
+    text-align: center;
+    margin: 8px 0;
+    overflow-x: auto;
+}
+/* Базовый математический шрифт (serif, как принято в формулах). */
+.math-inline, .math-display {
+    font-family: 'Cambria Math', 'STIX Two Math', 'Latin Modern Math',
+                 'Times New Roman', serif;
+    font-size: 1.03em;
+    line-height: 1.4;
+}
+/* Дроби: числитель над знаменателем с горизонтальной чертой. */
+.math-frac {
+    display: inline-flex;
+    flex-direction: column;
+    align-items: center;
+    vertical-align: middle;
+    margin: 0 .15em;
+    text-align: center;
+}
+.math-num { padding: 0 .25em; border-bottom: 1px solid currentColor; }
+.math-den { padding: 0 .25em; }
+/* Корень: знак радикала над подкоренным выражением. */
+.math-sqrt { white-space: nowrap; }
+.math-root { border-top: 1px solid currentColor; padding: 0 .1em; margin-left: .05em; }
+.math-sqrtdeg { font-size: .7em; vertical-align: super; margin-right: -.1em; }
+/* Степени и индексы. */
+.math-inline sup, .math-display sup { font-size: .72em; }
+.math-inline sub, .math-display sub { font-size: .72em; }
+/* Операторы/функции. */
+.math-op { font-size: 1.25em; line-height: 0; vertical-align: -.12em; }
+.math-fn { font-style: normal; }
+.math-rm { font-style: normal; }
+.math-bf { font-weight: 700; }
+.math-it { font-style: italic; }
+/* Акценты (\vec, \hat, \bar …). */
+.math-accent { position: relative; display: inline-block; }
+.math-acc {
+    position: absolute;
+    top: -.75em;
+    left: 0;
+    right: 0;
+    text-align: center;
+    font-size: .8em;
+    line-height: 1;
+}

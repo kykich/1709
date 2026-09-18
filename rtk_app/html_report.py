@@ -1,12 +1,14 @@
 """
 Построение HTML-фрагмента ответа из текста модели.
-Включает: экранирование HTML, inline-Markdown, парсинг Markdown-таблиц.
+Включает: экранирование HTML, inline-Markdown, парсинг Markdown-таблиц,
+а также рендеринг математических формул (LaTeX) в HTML/CSS.
 """
 import re
 
 __all__ = ["escape_html", "apply_inline_markdown", "text_to_html_paragraphs",
            "render_memory_marks", "mark_memory_fragments",
-           "count_memory_fragments", "render_with_memory_counts"]
+           "count_memory_fragments", "render_with_memory_counts",
+           "render_math", "extract_and_render_math"]
 
 # Маркеры, которыми помечаются фрагменты, взятые из памяти агента.
 #   [[R]]…[[/R]] — из РАБОЧЕЙ памяти   (подсветка фисташковым);
@@ -143,6 +145,361 @@ def escape_html(text):
             .replace('"', "&quot;"))
 
 
+# ======================================================================
+# Рендеринг математических формул (LaTeX) в HTML/CSS.
+# ----------------------------------------------------------------------
+# Проект работает локально/офлайн, без внешних CDN, поэтому формулы
+# разбираются СВОИМ небольшим конвертером LaTeX -> HTML: дроби, корни,
+# степени/индексы, суммы/интегралы/пределы, греческие буквы, операторы и
+# т.п. Результат — обычные HTML-элементы со стилями .math-* (см. style.css),
+# никакого внешнего JS не требуется.
+#
+# Поддерживаются разделители:
+#   $$…$$   и  \[…\]  — «выключная» формула (по центру, отдельным блоком);
+#   $…$     и  \(…\)  — «строчная» формула (внутри текста).
+# ======================================================================
+
+# Греческие буквы и часто используемые символы (имя команды -> символ).
+_MATH_SYMBOLS = {
+    "alpha": "α", "beta": "β", "gamma": "γ", "delta": "δ", "epsilon": "ε",
+    "varepsilon": "ε", "zeta": "ζ", "eta": "η", "theta": "θ", "vartheta": "ϑ",
+    "iota": "ι", "kappa": "κ", "lambda": "λ", "mu": "μ", "nu": "ν", "xi": "ξ",
+    "pi": "π", "varpi": "ϖ", "rho": "ρ", "varrho": "ϱ", "sigma": "σ",
+    "varsigma": "ς", "tau": "τ", "upsilon": "υ", "phi": "φ", "varphi": "φ",
+    "chi": "χ", "psi": "ψ", "omega": "ω",
+    "Gamma": "Γ", "Delta": "Δ", "Theta": "Θ", "Lambda": "Λ", "Xi": "Ξ",
+    "Pi": "Π", "Sigma": "Σ", "Upsilon": "Υ", "Phi": "Φ", "Psi": "Ψ",
+    "Omega": "Ω",
+    "cdot": "·", "times": "×", "div": "÷", "pm": "±", "mp": "∓",
+    "le": "≤", "leq": "≤", "ge": "≥", "geq": "≥", "ne": "≠", "neq": "≠",
+    "approx": "≈", "equiv": "≡", "sim": "∼", "propto": "∝",
+    "to": "→", "rightarrow": "→", "leftarrow": "←", "leftrightarrow": "↔",
+    "Rightarrow": "⇒", "Leftarrow": "⇐", "leftrightarrows": "⇄",
+    "in": "∈", "notin": "∉", "subset": "⊂", "supset": "⊃",
+    "subseteq": "⊆", "supseteq": "⊇", "cup": "∪", "cap": "∩",
+    "emptyset": "∅", "varnothing": "∅", "forall": "∀", "exists": "∃",
+    "neg": "¬", "land": "∧", "lor": "∨", "infty": "∞", "partial": "∂",
+    "nabla": "∇", "ldots": "…", "dots": "…", "cdots": "⋯",
+    "angle": "∠", "perp": "⊥", "parallel": "∥", "degree": "°",
+    "prime": "′", "ast": "∗",
+    # Функции (печатаются прямым шрифтом).
+    "sin": "sin", "cos": "cos", "tan": "tan", "cot": "cot", "sec": "sec",
+    "csc": "csc", "log": "log", "ln": "ln", "exp": "exp", "lim": "lim",
+    "max": "max", "min": "min", "arg": "arg", "gcd": "gcd", "mod": "mod",
+}
+
+# Операторы с индексами «снизу/сверху» (сумма, интеграл, предел …).
+_MATH_BIG_OPS = {
+    "sum": "∑", "prod": "∏", "int": "∫", "iint": "∬", "oint": "∮",
+    "lim": "lim", "limsup": "lim sup", "liminf": "lim inf",
+    "sup": "sup", "inf": "inf",
+}
+
+
+def _math_escape(s):
+    """Экранирует XML-спецсимволы внутри формулы (текст уже не экранирован)."""
+    return (s.replace("&", "&amp;").replace("<", "&lt;")
+             .replace(">", "&gt;"))
+
+
+def _tokenize_math(src):
+    """Лёгкая токенизация LaTeX: символы, команды, группы {} и спецсимволы.
+
+    Возвращает список токенов-строк. Группы {…} НЕ раскрываются здесь —
+    рекурсию по ним делает _render_group.
+    """
+    tokens = []
+    i, n = 0, len(src)
+    while i < n:
+        ch = src[i]
+        if ch == "\\":
+            j = i + 1
+            if j < n and src[j].isalpha():
+                while j < n and src[j].isalpha():
+                    j += 1
+                tokens.append(src[i:j])          # \команда
+                i = j
+            else:
+                tokens.append(src[i:j + 1])      # \x (экранированный символ)
+                i = j + 1
+        elif ch in "{}":
+            tokens.append(ch)
+            i += 1
+        elif ch == "^" or ch == "_":
+            tokens.append(ch)
+            i += 1
+        elif ch == " ":
+            tokens.append(" ")
+            i += 1
+        else:
+            tokens.append(ch)
+            i += 1
+    return tokens
+
+
+def _read_group(tokens, start):
+    """Читает один «аргумент» после start: либо {...}, либо один токен.
+
+    Возвращает (список_токенов_аргумента, индекс_после_аргумента). Если
+    следующего токена нет — возвращает ([], start).
+    """
+    j = start
+    while j < len(tokens) and tokens[j] == " ":
+        j += 1
+    if j >= len(tokens):
+        return [], j
+    if tokens[j] == "{":
+        depth = 0
+        k = j
+        while k < len(tokens):
+            if tokens[k] == "{":
+                depth += 1
+            elif tokens[k] == "}":
+                depth -= 1
+                if depth == 0:
+                    return tokens[j + 1:k], k + 1
+            k += 1
+        return tokens[j + 1:], len(tokens)   # незакрытая { — берём до конца
+    return [tokens[j]], j + 1                # одиночный токен
+
+
+def _render_tokens(tokens):
+    """Рекурсивно превращает список токенов LaTeX в HTML-строку.
+
+    Обрабатывает команды, степени ^, индексы _, дроби/корни и т.п.
+    Неизвестные команды выводятся как есть (без слэша) — текст не теряется.
+    """
+    out = []
+    i, n = 0, len(tokens)
+    while i < n:
+        tok = tokens[i]
+        if tok == " ":
+            out.append(" ")
+            i += 1
+            continue
+        if tok == "{":
+            group, i = _read_group(tokens, i)
+            out.append(_render_tokens(group))
+            continue
+        if tok == "}":
+            i += 1
+            continue
+        if tok == "^" or tok == "_":
+            arg, i = _read_group(tokens, i + 1)
+            inner = _render_tokens(arg)
+            cls = "math-sup" if tok == "^" else "math-sub"
+            tag = "sup" if tok == "^" else "sub"
+            out.append("<%s class='%s'>%s</%s>" % (tag, cls, inner, tag))
+            continue
+        if tok.startswith("\\"):
+            cmd = tok[1:]
+            # \frac{a}{b}
+            if cmd == "frac" or cmd == "dfrac" or cmd == "tfrac":
+                num, i = _read_group(tokens, i + 1)
+                den, i = _read_group(tokens, i)
+                out.append("<span class='math-frac'>"
+                           "<span class='math-num'>%s</span>"
+                           "<span class='math-den'>%s</span></span>"
+                           % (_render_tokens(num), _render_tokens(den)))
+                continue
+            # \sqrt[n]{x}
+            if cmd == "sqrt":
+                # Необязательный показатель степени: \sqrt[3]{x}
+                deg = None
+                j = i + 1
+                while j < len(tokens) and tokens[j] == " ":
+                    j += 1
+                if j < len(tokens) and tokens[j] == "[":
+                    k = j + 1
+                    buf = []
+                    while k < len(tokens) and tokens[k] != "]":
+                        buf.append(tokens[k])
+                        k += 1
+                    deg = buf
+                    i = k  # съели до ']'
+                body, i = _read_group(tokens, i + 1)
+                root = "<span class='math-root'>%s</span>" % _render_tokens(body)
+                if deg:
+                    root = ("<span class='math-sqrtdeg'>%s</span>%s"
+                            % (_render_tokens(deg), root))
+                out.append("<span class='math-sqrt'>&radic;" + root + "</span>")
+                continue
+            # \text{…} / \mathrm{…} / \mathbf{…} — прямым/полужирным шрифтом.
+            if cmd in ("text", "mathrm", "operatorname", "mathbf", "mathit"):
+                body, i = _read_group(tokens, i + 1)
+                cls = {"mathbf": "math-bf", "mathit": "math-it"}.get(cmd, "math-rm")
+                out.append("<span class='%s'>%s</span>"
+                           % (cls, _math_escape(_plain_group(body))))
+                continue
+            # \left / \right — просто игнорируем (размер скобок неважен).
+            if cmd in ("left", "right"):
+                i += 1
+                continue
+            # Операторы с индексами: \sum_{..}^{..}, \int, \lim и т.п.
+            if cmd in _MATH_BIG_OPS:
+                sym = _MATH_BIG_OPS[cmd]
+                op = "<span class='math-op'>%s</span>" % sym
+                sub, sup = None, None
+                # читаем возможно идущие _{...} и ^{...}
+                while i + 1 < n and tokens[i + 1] in ("_", "^"):
+                    which = tokens[i + 1]
+                    arg, i = _read_group(tokens, i + 2)
+                    if which == "_":
+                        sub = _render_tokens(arg)
+                    else:
+                        sup = _render_tokens(arg)
+                if sub is not None:
+                    op += "<sub class='math-sub'>%s</sub>" % sub
+                if sup is not None:
+                    op += "<sup class='math-sup'>%s</sup>" % sup
+                out.append(op)
+                i += 1
+                continue
+            # \vec{x}, \hat{x}, \bar{x}, \dot{x} — с акцентом.
+            if cmd in ("vec", "hat", "bar", "dot", "ddot", "tilde", "overline",
+                       "underline"):
+                body, i = _read_group(tokens, i + 1)
+                mark = {"vec": "→", "hat": "^", "bar": "‾", "overline": "‾",
+                        "dot": "·", "ddot": "··", "tilde": "~",
+                        "underline": "_"}.get(cmd, "")
+                out.append("<span class='math-accent'>%s<span class='math-acc'>%s"
+                           "</span></span>" % (_render_tokens(body), mark))
+                continue
+            # \mathbb{R} и т.п. — как обычный текст.
+            if cmd in ("mathbb", "mathcal", "mathfrak", "mathsf", "mathtt"):
+                body, i = _read_group(tokens, i + 1)
+                out.append("<span class='math-rm'>%s</span>"
+                           % _math_escape(_plain_group(body)))
+                continue
+            # Символы/функции по таблице.
+            if cmd in _MATH_SYMBOLS:
+                sym = _MATH_SYMBOLS[cmd]
+                if cmd in ("sin", "cos", "tan", "cot", "sec", "csc", "log",
+                           "ln", "exp", "max", "min", "arg", "gcd", "mod",
+                           "lim", "sup", "inf"):
+                    out.append("<span class='math-fn'>%s</span>" % sym)
+                else:
+                    out.append("<span class='math-sym'>%s</span>"
+                               % _math_escape(sym))
+                i += 1
+                continue
+            # Экранированные спецсимволы: \{ \} \% \_ \& \$ \# \,
+            if cmd in ("{", "}", "%", "_", "&", "$", "#", ",", ";", "!", " "):
+                out.append("&nbsp;" if cmd in (",", ";", "!", " ")
+                           else _math_escape(cmd))
+                i += 1
+                continue
+            # Неизвестная команда — выводим без слэша.
+            out.append(_math_escape(cmd))
+            i += 1
+            continue
+        # Обычный символ.
+        out.append(_math_escape(tok))
+        i += 1
+    return "".join(out)
+
+
+def _plain_group(tokens):
+    """Собирает «плоский» текст группы (для \\text{…} и \\mathbb{…})."""
+    parts = []
+    for t in tokens:
+        if t == "{":
+            continue
+        if t == "}":
+            continue
+        if t.startswith("\\"):
+            parts.append(_MATH_SYMBOLS.get(t[1:], t[1:]))
+        elif t in ("^", "_"):
+            parts.append({"^": "^", "_": "_"}[t])
+        else:
+            parts.append(t)
+    return "".join(parts)
+
+
+def render_math(latex, display=False):
+    """Рендерит одну формулу (без разделителей) в HTML.
+
+    display=True — выключная (блочная) формула по центру.
+    """
+    src = str(latex or "").strip()
+    inside = _render_tokens(_tokenize_math(src))
+    cls = "math-display" if display else "math-inline"
+    return "<span class='%s'>%s</span>" % (cls, inside)
+
+
+# Регулярное выражение для поиска формул вместе с разделителями.
+# Порядок альтернатив важен: сначала $$…$$, затем \[…\], потом $…$ и \(…\).
+_MATH_RE = re.compile(
+    r"(\$\$(?P<d1>.+?)\$\$)"                       # $$ … $$   (блок)
+    r"|(\\\[(?P<d2>.+?)\\\])"                      # \[ … \]   (блок)
+    r"|(?<!\\)(?<!\$)\$(?P<i1>.+?)(?<!\\)\$(?!\$)"  # $ … $     (строчная)
+    r"|(\\\((?P<i2>.+?)\\\))"                      # \( … \)   (строчная)
+    , re.DOTALL)
+
+
+# Признаки того, что содержимое $…$ — действительно ФОРМУЛА, а не просто
+# «доллары» в тексте (например «Цена $5 и $10»). Строчная $…$ принимается,
+# если внутри есть TeX-команда (\…) ИЛИ математические символы/операторы.
+_MATH_HINT_RE = re.compile(r"[\\^_{}=<>|*]|\d\s*[a-zA-Z]|[a-zA-Z]\s*[+\-/]\s*\d")
+
+
+def _looks_like_math(inner):
+    """Похоже ли содержимое $…$ на формулу (а не на цену/доллары в тексте)."""
+    s = inner.strip()
+    if not s:
+        return False
+    # Есть TeX-команда, степень/индекс, фигурные скобки, знак = и т.п.
+    if _MATH_HINT_RE.search(s):
+        return True
+    # Короткая строка без пробелов из букв/цифр (одна переменная: $x$, $n$).
+    if len(s) <= 3 and " " not in s and re.fullmatch(r"[a-zA-Z]+", s):
+        return True
+    return False
+
+
+def extract_and_render_math(text):
+    """Находит формулы в «сыром» тексте и заменяет их на HTML.
+
+    Возвращает (преобразованный_текст, список_html_формул). Преобразованный
+    текст содержит плейсхолдеры вида \\x00MATH0\\x00 вместо формул — их
+    позже (после экранирования и markdown) заменяют обратно на HTML.
+
+    Так формулы защищаются от экранирования и от разбора Markdown
+    (звёздочки/подчёркивания внутри формул не ломают разметку).
+    """
+    formulas = []
+
+    def _repl(m):
+        if m.group("d1") is not None:
+            latex, display = m.group("d1"), True
+        elif m.group("d2") is not None:
+            latex, display = m.group("d2"), True
+        elif m.group("i1") is not None:
+            latex, display = m.group("i1"), False
+            # Строчная $…$ — принимаем ТОЛЬКО если содержимое похоже на
+            # формулу (иначе «Цена $5 и $10» превратилось бы в формулу).
+            if not _looks_like_math(latex):
+                return m.group(0)          # оставляем как есть
+        else:
+            latex, display = m.group("i2"), False
+        html = render_math(latex, display=display)
+        idx = len(formulas)
+        formulas.append(html)
+        return "\x00MATH%d\x00" % idx
+
+    new_text = _MATH_RE.sub(_repl, text)
+    return new_text, formulas
+
+
+def restore_math(text, formulas):
+    """Возвращает HTML-формулы на место плейсхолдеров (после экранирования)."""
+    if not formulas:
+        return text
+    for idx, html in enumerate(formulas):
+        text = text.replace("\x00MATH%d\x00" % idx, html)
+    return text
+
+
 def apply_inline_markdown(text):
     """Преобразует inline-Markdown (жирный, курсив, код) в HTML-теги.
 
@@ -229,6 +586,10 @@ def render_with_memory_counts(text, memory=None):
     маркеров, расставленных моделью).
     """
     counts = {"working": 0, "longterm": 0}
+    # 0) ВЫДЕЛЯЕМ формулы из «сырого» текста в плейсхолдеры — до разметки
+    #    памяти и экранирования, чтобы символы формул (звёздочки, подчёрки-
+    #    вания, слэши) не ломали ни подсветку памяти, ни Markdown, ни HTML.
+    text, math_html = extract_and_render_math(text)
     # 1) Детерминированная разметка фрагментов памяти — до экранирования,
     #    пока текст ещё «сырой» (маркеры [[…]] экранирование не затрагивает).
     #    Считаем ТОЛЬКО реально поставленные метки (возвращает функция).
@@ -238,6 +599,9 @@ def render_with_memory_counts(text, memory=None):
         counts["longterm"] += det["longterm"]
     text = escape_html(text)
     text = apply_inline_markdown(text)
+    # Возвращаем формулы на место (их HTML не должен проходить ни через
+    # экранирование, ни через inline-Markdown — они уже готовы).
+    text = restore_math(text, math_html)
     # 2) Маркеры, расставленные САМОЙ моделью ([[R]]/[[L]]): учитываем те,
     #    что остались сверх уже подсчитанных детерминированных меток.
     counts["working"] = max(counts["working"], text.count(_MEM_OPEN_R))
