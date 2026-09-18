@@ -6,24 +6,18 @@
   * сжатие ИНКРЕМЕНТАЛЬНОЕ: дописывает вытесненное, как только история > keep;
   * _handle_compact НЕ затирает существующий summary пустой строкой.
 
-Запуск:  python check_server_context.py
+Запуск:  python tests/check_server_context.py
 """
 import os
 import sys
 
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+# Корень проекта — на уровень выше tests/.
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from rtk_app import config
 from rtk_app.session_store import SessionStore
 import web.server as srv
-
-FAIL = []
-
-
-def check(name, cond):
-    print(("  [OK] " if cond else "  [FAIL] ") + name)
-    if not cond:
-        FAIL.append(name)
+from tests.harness import check, finish
 
 
 class FakeAgent:
@@ -36,7 +30,7 @@ class FakeAgent:
 
     def answer(self, question, history=None, selected=None,
                max_tokens=None, compact=None, memory=None, profile=None,
-               answer_title=None):
+               answer_title=None, task_state=None):
         FakeAgent.last_history = list(history or [])
         return {"ok": True, "html": "", "text": "ok", "answers": [],
                 "meta": "", "usage": {}, "trace": []}
@@ -107,13 +101,7 @@ def main():
         pass
 
     print()
-    print("=== Итог ===")
-    if FAIL:
-        print("ПРОВАЛЕНО: %d" % len(FAIL))
-        for f in FAIL:
-            print("  - " + f)
-        sys.exit(1)
-    print("ВСЕ ПРОВЕРКИ ПРОЙДЕНЫ.")
+    sys.exit(finish("Итог"))
 
 
 if __name__ == "__main__":

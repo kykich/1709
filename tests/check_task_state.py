@@ -11,34 +11,18 @@
 Тест НЕ требует сети/LLM: проверяется чистая логика автомата
 (rtk_app.task_state.TaskState) и интеграция с хранилищем
 (rtk_app.session_store.SessionStore). Запуск:
-    python check_task_state.py
+    python tests/check_task_state.py
 """
 import os
 import sys
 import tempfile
 
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+# Корень проекта — на уровень выше tests/ (чтобы импортировать rtk_app и tests).
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from rtk_app.task_state import TaskState, STAGES, ALLOWED_TRANSITIONS
 from rtk_app.session_store import SessionStore
-
-PASS = 0
-FAIL = 0
-
-
-def check(title, cond, detail=""):
-    global PASS, FAIL
-    if cond:
-        PASS += 1
-        print("  [OK]   %s" % title)
-    else:
-        FAIL += 1
-        print("  [FAIL] %s  %s" % (title, ("- " + str(detail)) if detail else ""))
-
-
-def section(name):
-    print("\n== %s ==" % name)
-
+from tests.harness import check, section, finish, ensure_utf8
 
 GOAL = "Разработка приложения на Qt + C++"
 
@@ -202,14 +186,10 @@ def test_transition_table():
 
 
 def main():
-    # Гарантируем UTF-8 для вывода: иначе на Windows русский текст печатается
-    # в кодировке консоли (cp1251), и при захвате вывода как UTF-8 получаются
-    # «кракозябры» (например, при запуске теста со страницы через subprocess).
-    try:
-        sys.stdout.reconfigure(encoding="utf-8")
-        sys.stderr.reconfigure(encoding="utf-8")
-    except (AttributeError, ValueError):
-        pass
+    # Гарантируем UTF-8 для вывода (см. tests/harness.ensure_utf8): иначе на
+    # Windows русский текст печатается в cp1251 и при захвате вывода как
+    # UTF-8 (запуск со страницы через subprocess) получаются «кракозябры».
+    ensure_utf8()
     print("ТЕСТ: Состояние задачи (Task State Machine)")
     print("Сценарий: %s" % GOAL)
     test_clean_machine()
@@ -217,8 +197,7 @@ def main():
     test_prompt_block()
     test_store_persistence()
     test_transition_table()
-    print("\nИтог: %d OK, %d FAIL" % (PASS, FAIL))
-    return 0 if FAIL == 0 else 1
+    return finish()
 
 
 if __name__ == "__main__":

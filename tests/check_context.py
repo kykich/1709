@@ -6,26 +6,19 @@
      вытесненные сообщения в summary по мере вытеснения (Вариант A);
   3) summary хранится ОТДЕЛЬНО и подставляется в запрос вместо истории.
 
-Запуск:  python check_context.py
+Запуск:  python tests/check_context.py
 """
 import json
 import os
 import tempfile
 import sys
 
-# Гарантируем импорт пакета из корня проекта.
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+# Корень проекта — на уровень выше tests/.
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from rtk_app import config
 from rtk_app.session_store import SessionStore
-
-FAIL = []
-
-
-def check(name, cond):
-    print(("  [OK] " if cond else "  [FAIL] ") + name)
-    if not cond:
-        FAIL.append(name)
+from tests.harness import check, finish
 
 
 def make_store():
@@ -132,13 +125,7 @@ def main():
         except OSError:
             pass
 
-    print("=== Итог ===")
-    if FAIL:
-        print("ПРОВАЛЕНО проверок: %d" % len(FAIL))
-        for f in FAIL:
-            print("  - " + f)
-        sys.exit(1)
-    print("ВСЕ ПРОВЕРКИ ПРОЙДЕНЫ.")
+    sys.exit(finish("Итог"))
 
 
 if __name__ == "__main__":

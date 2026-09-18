@@ -722,7 +722,7 @@ class WebRequestHandler(BaseHTTPRequestHandler):
         import subprocess
         import sys as _sys
         root = config.BASE_DIR
-        script = os.path.join(root, "check_task_state.py")
+        script = os.path.join(root, "tests", "check_task_state.py")
         if not os.path.isfile(script):
             return self._send_json(500, {
                 "ok": False, "error": "Файл теста не найден: %s" % script})

@@ -7,9 +7,14 @@
   B2. запись в рабочую/долговременную память — ЯВНАЯ (по типу и ключу).
 
 Использует временный путь к файлу сессии, сеть/модели не задействованы.
+Запуск:  python tests/check_memory.py
 """
 import os
+import sys
 import tempfile
+
+# Корень проекта — на уровень выше tests/.
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from rtk_app.session_store import SessionStore
 

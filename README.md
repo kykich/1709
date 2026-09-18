@@ -96,14 +96,46 @@ python rtk_web.py 9000 0.0.0.0   # доступ с других машин
 │   ├── agent.py         # АГЕНТ: отдельная сущность, вся логика запросов к LLM
 │   ├── config.py        # пути/настройки, эндпоинт и модель
 │   ├── key_store.py     # чтение apidpsk.txt
+│   ├── key_check.py     # самодиагностика ключей моделей
 │   ├── deepseek.py      # клиент DeepSeek API (chat)
 │   ├── gigachat.py      # клиент GigaChat API (chat)
-│   └── html_report.py   # рендер Markdown-ответа в HTML
+│   ├── html_report.py   # рендер Markdown/LaTeX-ответа в HTML
+│   ├── session_store.py # история, память, ветки, факты, стратегии, задачи
+│   └── task_state.py    # конечный автомат задачи (переходы состояний)
 ├── web/
 │   └── server.py        # ThreadingHTTPServer + JSON-API (делегирует агенту)
+├── tests/               # автономные тесты (офлайн, без сети)
+│   ├── harness.py       # общая обвязка тестов (check/section/finish)
+│   └── check_*.py       # проверки логики, памяти, стратегий, сервера и т.д.
+├── docs/                # документация и ТЗ
+│   ├── task.md          # исходное ТЗ
+│   └── REPORT_task_traceability.md  # трассировка требований ТЗ → код → тест
+├── requirements.txt     # зависимостей нет (только stdlib), зафиксировано явно
 ├── apidpsk.txt          # файл с API-ключом (НЕ загружается на GitHub)
 ├── README.md
 └── .gitignore
+```
+
+## Тесты
+
+Автономные проверки (сеть/LLM не требуются) — запускаются из корня проекта:
+
+```bash
+python tests/check_task_state.py       # автомат задачи
+python tests/check_context.py          # сжатие контекста
+python tests/check_memory.py           # модель памяти
+python tests/check_memory_in_request.py# память в запросе к модели
+python tests/check_server_context.py   # контекст на стороне сервера
+python tests/check_strategies.py       # стратегии (sliding/facts/branch)
+python tests/check_auto_compact.py     # авто-сжатие через HTTP
+```
+
+Каждый тест печатает `[OK]`/`[FAIL]` по проверкам и строку
+`Итог: N OK, M FAIL`, возвращая код выхода `0` при успехе и `1` при провале.
+Общая обвязка вывода — `tests/harness.py`.
+
+`tests/test_mem_highlight.py` — ручная проверка (делает реальный запрос к
+модели, требует сеть и ключ).
 ```
 
 ## Лицензия

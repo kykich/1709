@@ -8,25 +8,19 @@
      переименование и удаление веток;
   5) summary (COMPACT_*) работает ПОВЕРХ выбранной стратегии.
 
-Запуск:  python check_strategies.py
+Запуск:  python tests/check_strategies.py
 """
 import json
 import os
 import tempfile
 import sys
 
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+# Корень проекта — на уровень выше tests/.
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from rtk_app import config
 from rtk_app.session_store import SessionStore
-
-FAIL = []
-
-
-def check(name, cond):
-    print(("  [OK] " if cond else "  [FAIL] ") + name)
-    if not cond:
-        FAIL.append(name)
+from tests.harness import check, finish
 
 
 def make_store():
@@ -165,13 +159,7 @@ def main():
         except OSError:
             pass
 
-    print("=== Итог ===")
-    if FAIL:
-        print("ПРОВАЛЕНО проверок: %d" % len(FAIL))
-        for f in FAIL:
-            print("  - " + f)
-        sys.exit(1)
-    print("ВСЕ ПРОВЕРКИ ПРОЙДЕНЫ.")
+    sys.exit(finish("Итог"))
 
 
 if __name__ == "__main__":

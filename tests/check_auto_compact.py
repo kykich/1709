@@ -9,7 +9,7 @@
     и в следующий запрос подставляет summary + последние keep сообщений;
   * проверяем, что summary хранится отдельно (compact.summary).
 
-Запуск:  python check_auto_compact.py
+Запуск:  python tests/check_auto_compact.py
 """
 import json
 import os
@@ -18,18 +18,12 @@ import tempfile
 import threading
 import urllib.request
 
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+# Корень проекта — на уровень выше tests/.
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from rtk_app import config
 from rtk_app import session_store as ss_mod
-
-FAIL = []
-
-
-def check(name, cond):
-    print(("  [OK] " if cond else "  [FAIL] ") + name)
-    if not cond:
-        FAIL.append(name)
+from tests.harness import check, finish
 
 
 class FakeAgent:
@@ -45,7 +39,7 @@ class FakeAgent:
 
     def answer(self, question, history=None, selected=None,
                max_tokens=None, compact=None, memory=None, profile=None,
-               answer_title=None):
+               answer_title=None, task_state=None):
         self.sent.append(list(history or []))
         return {"ok": True, "html": "", "text": "ok", "answers": [],
                 "meta": "", "usage": {"input": 1, "output": 1,
@@ -141,13 +135,7 @@ def main():
         httpd.server_close()
 
     print()
-    print("=== Итог ===")
-    if FAIL:
-        print("ПРОВАЛЕНО: %d" % len(FAIL))
-        for f in FAIL:
-            print("  - " + f)
-        sys.exit(1)
-    print("ВСЕ ПРОВЕРКИ ПРОЙДЕНЫ.")
+    sys.exit(finish("Итог"))
 
 
 if __name__ == "__main__":

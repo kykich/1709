@@ -14,16 +14,12 @@ import os
 import sys
 import tempfile
 
+# Корень проекта — на уровень выше tests/.
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
 from rtk_app.agent import Agent
 from rtk_app.session_store import SessionStore
-
-FAIL = []
-
-
-def check(name, cond):
-    print(("  [OK] " if cond else "  [FAIL] ") + name)
-    if not cond:
-        FAIL.append(name)
+from tests.harness import check, finish
 
 
 def _fresh_store():
@@ -85,12 +81,7 @@ def main():
           roles == ["system", "user", "assistant", "user"])
 
     print()
-    if FAIL:
-        print("ПРОВАЛЕНО: %d" % len(FAIL))
-        for f in FAIL:
-            print("  - " + f)
-        sys.exit(1)
-    print("ВСЕ ПРОВЕРКИ ПЕРЕДАЧИ ПАМЯТИ В ЗАПРОС ПРОЙДЕНЫ.")
+    sys.exit(finish("Итог"))
 
 
 if __name__ == "__main__":
